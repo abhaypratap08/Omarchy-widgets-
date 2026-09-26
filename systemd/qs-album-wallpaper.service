@@ -1,0 +1,21 @@
+[Unit]
+Description=Quickshell album-art wallpaper switcher
+Documentation=https://quickshell.org/docs/v0.3.1/types/Quickshell/IpcHandler
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+# quickshell is a Qt client, and Qt aborts with "no Qt platform plugin could
+# be initialized" (exit 255) if the compositor socket is not up yet.
+# After=graphical-session.target alone does not guarantee that, so at every
+# login this unit used to crash once and only come back via Restart=on-failure.
+# Wait for the socket first (bounded at 10s, then fail so Restart retries).
+ExecStartPre=/bin/sh -c 'i=0; while [ "$i" -lt 100 ]; do d="${WAYLAND_DISPLAY:-}"; if [ -n "$d" ]; then case "$d" in /*) p="$d";; *) p="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/$d";; esac; [ -S "$p" ] && exit 0; fi; i=$((i + 1)); sleep 0.1; done; exit 1'
+ExecStart=/usr/bin/quickshell -c album-wallpaper
+Restart=on-failure
+RestartSec=2
+Slice=app.slice
+
+[Install]
+WantedBy=default.target
