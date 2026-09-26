@@ -1,2691 +1,1401 @@
-// shell.qml — standalone Quickshell MPRIS now-playing card (minimalist)
+pragma ComponentBehavior: Bound
 
+import QtQml
 import QtQuick
 import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
-import Quickshell.Widgets
 import Quickshell.Wayland
 import Quickshell.Services.Mpris
 
+/*
+ * music-widget — MPRIS now-playing card for Omarchy
+ * -------------------------------------------------
+ * A single layer-shell card showing the active player's artwork, title,
+ * artist, seek bar and transport controls. It is a standalone Quickshell
+ * config: it imports no private Omarchy QML modules and reads only the
+ * generated theme files plus the public MPRIS interfaces.
+ *
+ * RUN
+ *   quickshell -c music-widget
+ *
+ * LAYER NOTES
+ *   The card lives on the Bottom layer, directly above the wallpaper and
+ *   below the Omarchy bar. It reserves no exclusive zone so it never
+ *   pushes windows around, and it never animates its own surface size --
+ *   resizing a layer-shell surface makes Hyprland recreate it, which shows
+ *   up as a visible flicker. The card is therefore a fixed size and only
+ *   its contents react to state changes.
+ */
+
 ShellRoot {
+    id: root
+
+    /* =================================================================
+     * Configuration
+     * ================================================================= */
+
+    // Card geometry. Fixed so the surface is created once.
+    readonly property int cardWidth: 380
+    // Must equal pad*2 + art(72) + seek(29) + transport(32) + spacing*2.
+    // Anything smaller does not just look tight: the ColumnLayout overflows,
+    // and because a layer-shell window clips to its own surface, the
+    // overflowing rows are not drawn at all. At the old value of 132 the
+    // whole transport row sat below the card and never reached the screen.
+    readonly property int cardHeight: 185
+    readonly property int cornerRadius: 18
+    readonly property int pad: 16
+
+    // Distance from the bottom of the screen. Sits clear of the bar.
+    readonly property int bottomInset: 34
+
+    /* =================================================================
+     * Theme
+     * ================================================================= */
+
+    readonly property string omarchyStateDir:
+        (Quickshell.env("HOME") || "/tmp") + "/.local/state"
+    readonly property string currentThemePath:
+        omarchyStateDir + "/omarchy/current/theme"
+    readonly property string themeNamePath:
+        omarchyStateDir + "/omarchy/current/theme.name"
+
+    QtObject {
+        id: theme
+
+        // FileViews for the generated Omarchy theme. Omarchy replaces the
+        // theme directory and then writes theme.name, so theme.name is the
+        // signal that the new files are safe to read.
+        property FileView colorsFile: FileView {
+            path: root.currentThemePath + "/colors.toml"
+            watchChanges: false
+            printErrors: false
+            onLoaded: theme.setColorValues(text())
+        }
+
+        property FileView shellFile: FileView {
+            path: root.currentThemePath + "/shell.toml"
+            watchChanges: false
+            printErrors: false
+            onLoaded: theme.setThemeShellValues(text())
+        }
+
+        property FileView themeNameFile: FileView {
+            path: root.themeNamePath
+            watchChanges: true
+            printErrors: false
+            onFileChanged: theme.reloadTheme()
+        }
+
+        function reloadTheme() {
+            colorsFile.reload();
+            shellFile.reload();
+        }
+
+        property var colorValues: ({})
+        property var themeShellValues: ({})
+        property var values: ({})
+
+        // Omarchy's generated files use a small TOML subset. Keep the
+        // parser local so this module remains standalone and does not
+        // import private shell QML modules.
+        function stripComment(line) {
+            let quote = "";
+            let escaped = false;
+
+            for (let i = 0; i < line.length; i++) {
+                const ch = line.charAt(i);
+                if (quote) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (ch === "\\") {
+                        escaped = true;
+                    } else if (ch === quote) {
+                        quote = "";
+                    }
+                } else if (ch === "\"" || ch === "'") {
+                    quote = ch;
+                } else if (ch === "#") {
+                    return line.substring(0, i);
+                }
+            }
+
+            return line;
+        }
+
+        function parseValue(raw) {
+            const value = String(raw || "").replace(/^\s+|\s+$/g, "");
+            if (!value) return null;
+
+            const quote = value.charAt(0);
+            if (quote === "\"" || quote === "'") {
+                let escaped = false;
+                for (let i = 1; i < value.length; i++) {
+                    const ch = value.charAt(i);
+                    if (quote === "\"" && escaped) {
+                        escaped = false;
+                    } else if (quote === "\"" && ch === "\\") {
+                        escaped = true;
+                    } else if (ch === quote) {
+                        const trailing = value.substring(i + 1).replace(/^\s+|\s+$/g, "");
+                        if (trailing && trailing.charAt(0) !== "#")
+                            return null;
+                        return value.substring(1, i).replace(/\\([\\"])/g, "$1");
+                    }
+                }
+                return null;
+            }
+
+            return value;
+        }
+
+        function parseToml(raw) {
+            const parsed = {};
+            let section = "";
+            const lines = String(raw || "").split(/\r?\n/);
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = stripComment(lines[i]).replace(/^\s+|\s+$/g, "");
+                if (!line || line.charAt(0) === "#") continue;
+
+                const sectionMatch = line.match(/^\[([A-Za-z0-9_.-]+)\]\s*$/);
+                if (sectionMatch) {
+                    section = sectionMatch[1];
+                    continue;
+                }
+
+                const equals = line.indexOf("=");
+                if (equals < 0) continue;
+                const key = line.substring(0, equals).replace(/^\s+|\s+$/g, "");
+                if (!/^[A-Za-z0-9_-]+$/.test(key)) continue;
+
+                const value = parseValue(line.substring(equals + 1));
+                if (value === null) continue;
+                parsed[(section ? section + "." : "") + key] = value;
+            }
+
+            return parsed;
+        }
+
+        function rebuildValues() {
+            const merged = {};
+            const sources = [colorValues, themeShellValues];
+            for (let i = 0; i < sources.length; i++) {
+                const source = sources[i] || {};
+                for (const key in source) merged[key] = source[key];
+            }
+
+            // Omarchy accepts both the semantic palette and its short
+            // aliases. Mirror the aliases that are useful to color-only
+            // consumers so older themes resolve consistently too.
+            const aliases = {
+                "bg": "background",
+                "fg": "foreground",
+                "dark_bg": "dark_background",
+                "darker_bg": "darker_background",
+                "lighter_bg": "lighter_background",
+                "dark_fg": "dark_foreground",
+                "light_fg": "light_foreground",
+                "bright_fg": "bright_foreground",
+                "purple": "magenta",
+                "bright_purple": "bright_magenta"
+            };
+            for (const alias in aliases) {
+                if (merged[alias] === undefined && merged[aliases[alias]] !== undefined)
+                    merged[alias] = merged[aliases[alias]];
+            }
+
+            values = merged;
+        }
+
+        function setColorValues(raw) {
+            colorValues = parseToml(raw);
+            rebuildValues();
+        }
+
+        function setThemeShellValues(raw) {
+            themeShellValues = parseToml(raw);
+            rebuildValues();
+        }
+
+        function splitColorTokens(value) {
+            const parts = [];
+            let current = "";
+            let depth = 0;
+            let quote = "";
+
+            for (let i = 0; i < value.length; i++) {
+                const ch = value.charAt(i);
+                if (quote) {
+                    current += ch;
+                    if (ch === quote)
+                        quote = "";
+                } else if (ch === "\"" || ch === "'") {
+                    quote = ch;
+                    current += ch;
+                } else if (ch === "(") {
+                    depth++;
+                    current += ch;
+                } else if (ch === ")") {
+                    depth = Math.max(0, depth - 1);
+                    current += ch;
+                } else if (/\s/.test(ch) && depth === 0) {
+                    if (current) parts.push(current);
+                    current = "";
+                } else {
+                    current += ch;
+                }
+            }
+            if (current) parts.push(current);
+            return parts;
+        }
+
+        function firstColorToken(value) {
+            const parts = splitColorTokens(String(value || ""));
+            for (let i = 0; i < parts.length; i++) {
+                if (!/^-?\d+(?:\.\d+)?deg$/i.test(parts[i]))
+                    return parts[i];
+            }
+            return "";
+        }
+
+        function byteHex(number) {
+            const n = Math.max(0, Math.min(255, Math.round(number)));
+            return ("0" + n.toString(16)).slice(-2);
+        }
+
+        function alphaHex(value) {
+            if (value === undefined || value === null || value === "")
+                return "ff";
+            const text = String(value).trim();
+            if (text.charAt(text.length - 1) === "%") {
+                // Divide first: "50% * 2.55" lands just under 127.5 in
+                // floating point and rounds to 0x7f instead of 0x80.
+                return byteHex(parseFloat(text.substring(0, text.length - 1)) / 100 * 255);
+            }
+            const alpha = parseFloat(text);
+            return byteHex((isNaN(alpha) ? 1 : alpha) * 255);
+        }
+
+        function normalizeHex(value) {
+            let hex = String(value || "").replace(/^#/, "");
+            if (!/^[0-9a-f]+$/i.test(hex)) return "";
+
+            if (hex.length === 3 || hex.length === 4) {
+                let expanded = "";
+                for (let i = 0; i < hex.length; i++)
+                    expanded += hex.charAt(i) + hex.charAt(i);
+                hex = expanded;
+            }
+            if (hex.length === 6)
+                return "#" + hex.toLowerCase();
+            if (hex.length === 8) {
+                // Omarchy/Hyprland colors use #RRGGBBAA; QML uses
+                // #AARRGGBB for an eight-digit color literal.
+                return "#" + hex.substring(6, 8).toLowerCase() +
+                    hex.substring(0, 6).toLowerCase();
+            }
+            return "";
+        }
+
+        function normalizeColor(value) {
+            const token = String(value || "").replace(/^\s+|\s+$/g, "");
+            if (!token) return "";
+            if (token === "transparent") return "#00000000";
+
+            const hex = normalizeHex(token);
+            if (hex) return hex;
+
+            const rgb = token.match(/^rgba?\(([^)]*)\)$/i);
+            if (rgb) {
+                const parts = rgb[1].split(",").map(function (part) {
+                    return part.replace(/^\s+|\s+$/g, "");
+                });
+                if (parts.length === 1 && /^#?[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(parts[0])) {
+                    return normalizeHex("#" + parts[0].replace(/^#/, ""));
+                }
+                if (parts.length >= 3) {
+                    // Comma-separated components are decimal, matching
+                    // Omarchy's own color conversion. The hex spelling
+                    // (for example rgba(1e1e2eff)) is handled by the
+                    // single-argument branch above, so a two-digit
+                    // decimal such as 46 must not be read as a hex pair.
+                    const r = parseFloat(parts[0].replace(/^#/, ""));
+                    const g = parseFloat(parts[1].replace(/^#/, ""));
+                    const b = parseFloat(parts[2].replace(/^#/, ""));
+                    const a = parts.length > 3 ? alphaHex(parts[3]) : "ff";
+                    if (!isNaN(r) && !isNaN(g) && !isNaN(b))
+                        return "#" + a + byteHex(r) + byteHex(g) + byteHex(b);
+                }
+            }
+
+            if (/^(?:hsl|hsla)\(/i.test(token))
+                return token;
+            return "";
+        }
+
+        function resolveToken(token, depth) {
+            if (depth > 16) return "";
+
+            const value = String(token || "").replace(/^\s+|\s+$/g, "");
+            if (!value) return "";
+
+            if (value === "text")
+                return resolveToken("foreground", depth + 1);
+            if (value === "transparent")
+                return "#00000000";
+            if (values[value] !== undefined && values[value] !== value)
+                return resolveToken(values[value], depth + 1);
+
+            // Color-only consumers use the first stop of an Omarchy
+            // shell gradient (for example, rgba(...) rgba(...) 45deg).
+            const first = firstColorToken(value);
+            if (first && first !== value)
+                return resolveToken(first, depth + 1);
+            return normalizeColor(value);
+        }
+
+        function pickColor(keys, fallback) {
+            for (let i = 0; i < keys.length; i++) {
+                const resolved = resolveToken(values[keys[i]], 0);
+                if (resolved) return resolved;
+            }
+            return fallback;
+        }
+
+        function luminance(col) {
+            return 0.299 * col.r + 0.587 * col.g + 0.114 * col.b;
+        }
+
+        readonly property color baseBackground: pickColor(["background", "color0"], "#1b1d1e")
+        readonly property color baseForeground: pickColor(["foreground", "color7"], "#c6c5bf")
+        readonly property color baseAccent: pickColor(["accent", "color4"], "#fcef0c")
+        readonly property color baseMuted: pickColor(["muted", "color8"], baseForeground)
+
+        readonly property color surface: pickColor(["popups.background", "background"], baseBackground)
+        readonly property bool dark: luminance(surface) < 0.5
+        readonly property color surfaceHigh: Qt.lighter(surface, dark ? 1.08 : 0.94)
+        readonly property color surfaceHighest: Qt.lighter(surface, dark ? 1.14 : 0.88)
+        readonly property color foreground: pickColor(["popups.text", "foreground"], baseForeground)
+        readonly property color muted: pickColor(["muted", "color8"], baseMuted)
+        readonly property color accent: baseAccent
+        readonly property color onAccent: luminance(accent) > 0.5 ? "#101015" : "#ffffff"
+    }
+
+    readonly property color colText: theme.foreground
+    readonly property color colDim: theme.muted
+    readonly property color colAccent: theme.accent
+    readonly property color colOnAccent: theme.onAccent
+    readonly property color colSurface: theme.surfaceHigh
+    readonly property color colBorder: Qt.alpha(theme.foreground, 0.10)
+
+    /* =================================================================
+     * Player selection
+     * ================================================================= */
+
+    readonly property var allPlayers: {
+        const list = Mpris.players ? Mpris.players.values : [];
+        // Sort so the list order is stable between updates; an unstable
+        // order makes the "current player" jump around on its own.
+        return list.slice().sort(function (a, b) {
+            return (a.identity || "").localeCompare(b.identity || "");
+        });
+    }
+
+    // -1 follows the active player automatically.
+    property int manualIndex: -1
+
+    readonly property var player: {
+        if (manualIndex >= 0 && manualIndex < allPlayers.length)
+            return allPlayers[manualIndex];
+        if (allPlayers.length === 0)
+            return null;
+        // Prefer something that is actually playing, else the first entry.
+        for (const p of allPlayers) {
+            if (p.playbackState === MprisPlaybackState.Playing)
+                return p;
+        }
+        return allPlayers[0];
+    }
+
+    readonly property bool hasPlayer: player !== null
+
+    readonly property bool isPlaying:
+        hasPlayer && player.playbackState === MprisPlaybackState.Playing
+
+    readonly property bool canControl: hasPlayer && player.canControl === true
+    readonly property bool canSeek: canControl && player.canSeek === true
+    // position may only be written when the player supports it.
+    readonly property bool canSetPosition:
+        canSeek && player.positionSupported === true
+    readonly property bool canGoPrevious: canControl && player.canGoPrevious === true
+    readonly property bool canGoNext: canControl && player.canGoNext === true
+    // Play/pause is offered whenever either direction is available.
+    readonly property bool canTogglePlay:
+        canControl && (player.canTogglePlaying === true
+                       || player.canPlay === true
+                       || player.canPause === true)
+
+    /* ---- volume, shuffle, repeat -------------------------------------
+     *
+     * MPRIS only permits writing these when the player advertises the
+     * matching capability, and support varies wildly between players. Each
+     * control is therefore hidden rather than shown-but-dead, matching how
+     * the transport buttons above already behave.
+     * ------------------------------------------------------------------ */
+
+    readonly property bool canSetVolume:
+        hasPlayer && canControl && player.volumeSupported === true
+
+    readonly property bool canToggleShuffle:
+        hasPlayer && canControl && player.shuffleSupported === true
+
+    readonly property bool canCycleLoop:
+        hasPlayer && canControl && player.loopSupported === true
+
+    // MPRIS volume is 0.0-1.0.
+    readonly property real volumeLevel:
+        canSetVolume ? Math.max(0, Math.min(1, Number(player.volume))) : 0
+
+    readonly property bool shuffleOn:
+        canToggleShuffle && player.shuffle === true
+
+    // Repeat has three states but only one button, so "repeat this track"
+    // needs its own artwork. Lucide ships `repeat-1`, whose numeral is part
+    // of the vector path -- so the distinction needs no text badge at all.
+    // Off and repeat-all share the plain loop and are told apart by the
+    // button's `active` tint.
+    readonly property string loopIcon:
+        canCycleLoop && player.loopState === MprisLoopState.Track
+            ? "repeat-1" : "repeat"
+
+    readonly property bool loopOn:
+        canCycleLoop && player.loopState !== MprisLoopState.None
+
+    // ---- artwork ----------------------------------------------------
+
+    // MPRIS players advertise artwork however they please: a local file for
+    // some, an https CDN link for others. Spotify -- the player this widget
+    // is normally pointed at -- only ever hands out https, so accepting
+    // file:// alone left the cover permanently blank.
+    readonly property string rawArtUrl:
+        hasPlayer && player.trackArtUrl ? String(player.trackArtUrl).trim() : ""
+
+    // Qt Quick has no network image loader, so a remote URL cannot be bound
+    // straight to Image.source. `artPath` is therefore always a local file:
+    // either the player's own file:// path, or a copy fetched into the cache
+    // below. It stays "" while a fetch is outstanding, which is what the
+    // placeholder keys off.
+    property string artPath: ""
+
+    readonly property string artSource:
+        artPath ? artFileUrl(artPath) : ""
+
+    readonly property string artCacheDir:
+        ((Quickshell.env("XDG_CACHE_HOME") ||
+            ((Quickshell.env("HOME") || "/tmp") + "/.cache")) + "/music-widget")
+
+    readonly property int keepCachedArt: 12
+
+    // ---- artwork fetch state -- don't touch ----
+
+    property bool artCacheReady: false
+    property string artFetchUrl: ""
+    property string artFetchPath: ""
+    // Every fetch carries the request id that started it, so a slow download
+    // belonging to a skipped track can never overwrite the current cover.
+    property int artRequestId: 0
+    property int artAttempts: 0
+
+    // A file:// URL with each path segment percent-encoded, so spaces in a
+    // cache path can't break Image.source.
+    function artFileUrl(path) {
+        if (!path)
+            return "";
+        return "file://" + String(path).split("/").map(encodeURIComponent).join("/");
+    }
+
+    // One stable filename per art URL, so a cover is fetched once and served
+    // from cache afterwards. Deliberately extension-less: Qt detects the
+    // format from the file's contents, so a CDN serving WebP or PNG is never
+    // stored under a misleading name.
+    function artFileNameFor(url) {
+        const s = String(url);
+        let h = 5381;
+        for (let i = 0; i < s.length; ++i)
+            h = (Math.imul(h, 33) + s.charCodeAt(i)) >>> 0;
+        const tail = s.split("/").pop().replace(/[^a-zA-Z0-9]/g, "").slice(-16);
+        return (tail ? tail + "_" : "") + h.toString(16);
+    }
+
+    // Point the artwork at something loadable, fetching it first when the
+    // player only offered a remote URL.
+    function resolveArt() {
+        const url = rawArtUrl;
+
+        if (!url) {
+            artRequestId += 1;
+            artFetchUrl = "";
+            artFetchPath = "";
+            artPath = "";
+            return;
+        }
+
+        // Already a local file: use it as-is, no copy needed.
+        if (/^file:\/\//i.test(url)) {
+            artRequestId += 1;
+            artFetchUrl = "";
+            artFetchPath = "";
+            let path = "";
+            try {
+                path = decodeURIComponent(url.substring(7));
+            } catch (error) {
+                console.warn("[musicwidget] invalid local artwork URL:", url, error);
+            }
+            artPath = path;
+            return;
+        }
+
+        // Only http(s) can be fetched; anything else is not artwork we can show.
+        if (!/^https?:\/\//i.test(url)) {
+            console.warn("[musicwidget] unsupported artwork URL:", url);
+            artRequestId += 1;
+            artFetchUrl = "";
+            artFetchPath = "";
+            artPath = "";
+            return;
+        }
+
+        const path = artCacheDir + "/" + artFileNameFor(url);
+
+        // Already showing this cover, or already fetching it: nothing to do.
+        if (artPath === path || artFetchUrl === url)
+            return;
+
+        artFetchUrl = url;
+        artFetchPath = path;
+        artAttempts = 0;
+        artRequestId += 1;
+        startArtFetch(artRequestId);
+    }
+
+    function startArtFetch(id) {
+        if (id !== artRequestId || !artFetchUrl || !artFetchPath)
+            return;
+
+        if (!artCacheReady) {
+            artFetchProc.waitingForCache = true;
+            artMkdirProc.running = true;
+            return;
+        }
+
+        artFetchProc.requestId = id;
+        artFetchProc.url = artFetchUrl;
+        artFetchProc.outFile = artFetchPath;
+        artFetchProc.running = true;
+    }
+
+    function handleArtFetchExit(id, url, outFile, exitCode) {
+        if (id !== artRequestId || url !== artFetchUrl || outFile !== artFetchPath) {
+            // A cover we no longer want. Drop the file, unless a newer request
+            // for the same cover is already using it.
+            if (outFile && outFile !== artFetchPath)
+                discardArtFile(outFile);
+            return;
+        }
+
+        if (exitCode !== 0) {
+            discardArtFile(outFile);
+            artAttempts += 1;
+            if (artAttempts < 2) {
+                artRetryTimer.restart();
+                return;
+            }
+            console.warn("[musicwidget] artwork download failed", url, "exit", exitCode);
+            artFetchUrl = "";
+            artFetchPath = "";
+            return;
+        }
+
+        artRetryTimer.stop();
+        artAttempts = 0;
+        artPath = outFile;
+        pruneArtCache();
+    }
+
+    function discardArtFile(path) {
+        if (!path)
+            return;
+        artCleanupProc.path = path;
+        artCleanupProc.running = true;
+    }
+
+    // Keep only the most recent covers so the cache doesn't grow forever over
+    // a long listening session. The on-screen cover and any in-flight fetch
+    // are passed as positional arguments and never pruned.
+    readonly property string artPruneScript: [
+        'cd "$1" || exit 0',
+        'keep="$2"',
+        'shift 2',
+        'ls -1t | tail -n +"$keep" | while IFS= read -r name; do',
+        '  skip=0',
+        '  for p in "$@"; do [ -n "$p" ] && [ "$name" = "${p##*/}" ] && skip=1; done',
+        '  [ "$skip" -eq 0 ] && rm -f -- "$name"',
+        'done',
+        'exit 0'
+    ].join("\n")
+
+    function pruneArtCache() {
+        artPruneProc.keep = Math.max(1, keepCachedArt + 1);
+        artPruneProc.running = true;
+    }
+
+    Process {
+        id: artMkdirProc
+        command: ["mkdir", "-p", root.artCacheDir]
+        onExited: (exitCode, exitStatus) => {
+            root.artCacheReady = exitCode === 0;
+            if (exitCode !== 0) {
+                console.warn("[musicwidget] could not create artwork cache", root.artCacheDir);
+            } else if (artFetchProc.waitingForCache) {
+                artFetchProc.waitingForCache = false;
+                root.startArtFetch(root.artRequestId);
+            }
+        }
+    }
+
+    Process {
+        id: artFetchProc
+        property int requestId: 0
+        property string url: ""
+        property string outFile: ""
+        property bool waitingForCache: false
+
+        // Reuse an already-cached copy instead of refetching it. Paths are
+        // passed as positional arguments so a hostile XDG_CACHE_HOME can never
+        // reach the shell.
+        command: ["bash", "-c", [
+            'if [ -f "$1" ]; then exit 0; fi',
+            // --output must precede `--`: everything after `--` is a URL, so
+            // a trailing `-o` would be parsed as one.
+            'curl --fail --silent --show-error --location --max-time 20 --output "$1" -- "$2"'
+        ].join("\n"), "artfetch", outFile, url]
+        // Quickshell reads `command` once when `running` flips, so the
+        // arguments must be plain properties rather than bindings that
+        // re-evaluate mid-flight.
+
+        onExited: (exitCode, exitStatus) =>
+            root.handleArtFetchExit(requestId, url, outFile, exitCode)
+    }
+
+    Process {
+        id: artCleanupProc
+        property string path: ""
+        command: ["rm", "-f", "--", path]
+    }
+
+    Process {
+        id: artPruneProc
+        property int keep: 12
+        command: ["bash", "-c", root.artPruneScript, "artprune", root.artCacheDir,
+            String(keep), root.artPath, root.artFetchPath]
+    }
+
+    Timer {
+        id: artRetryTimer
+        interval: 700
+        repeat: false
+        onTriggered: root.startArtFetch(root.artRequestId)
+    }
+
+    // Re-resolve whenever the advertised art URL changes. This single hook
+    // covers both a track change and a player appearing after startup: MPRIS
+    // discovery is asynchronous, and a player that shows up already holding an
+    // art URL never emits trackArtUrlChanged of its own.
+    onRawArtUrlChanged: resolveArt()
+
+    Component.onCompleted: artMkdirProc.running = true
+
+    readonly property color placeholderColor:
+        Qt.alpha(theme.accent, theme.dark ? 0.18 : 0.14)
+
+    /* ---- metadata --------------------------------------------------- */
+
+    readonly property string trackTitle: {
+        if (!hasPlayer || !player.trackTitle)
+            return "Not playing";
+        return String(player.trackTitle);
+    }
+
+    readonly property string trackArtist: {
+        if (!hasPlayer || !player.trackArtist)
+            return "";
+        return String(player.trackArtist);
+    }
+
+    /* ---- position --------------------------------------------------- */
+
+    // MPRIS reports position and length in *seconds*.
+    //
+    // `position` is deliberately not reactive in Quickshell: reading it is
+    // always current, but bindings are only re-evaluated if the change
+    // signal fires, which players rarely do. `positionTicker` re-emits it
+    // so the seek bar advances.
+    readonly property real positionSec:
+        hasPlayer ? Number(player.position || 0) : 0
+    readonly property real lengthSec:
+        hasPlayer ? Number(player.length || 0) : 0
+
+    Timer {
+        id: positionTicker
+        interval: 500
+        repeat: true
+        running: root.hasPlayer && root.isPlaying
+        onTriggered: {
+            if (root.hasPlayer)
+                root.player.positionChanged();
+        }
+    }
+
+    readonly property real progress: {
+        if (lengthSec <= 0)
+            return 0;
+        return Math.max(0, Math.min(1, positionSec / lengthSec));
+    }
+
+    function mmss(sec) {
+        const total = Math.max(0, Math.floor(sec));
+        const hours = Math.floor(total / 3600);
+        const minutes = Math.floor((total % 3600) / 60);
+        const seconds = total % 60;
+        const pad = (n) => (n < 10 ? "0" : "") + n;
+        return hours > 0 ? hours + ":" + pad(minutes) + ":" + pad(seconds)
+                         : minutes + ":" + pad(seconds);
+    }
+
+    /* =================================================================
+     * Controls
+     *
+     * Every write is guarded by the capability flags. Writing an
+     * unsupported property is a D-Bus error and leaves the widget
+     * looking stuck, so an unsupported control is hidden rather than
+     * shown-but-dead.
+     * ================================================================= */
+
+    function togglePlay() {
+        if (!canTogglePlay)
+            return;
+        if (player.canTogglePlaying === true) {
+            player.togglePlaying();
+            return;
+        }
+        if (isPlaying) {
+            if (player.canPause === true)
+                player.pause();
+        } else if (player.canPlay === true) {
+            player.play();
+        }
+    }
+
+    function previous() {
+        if (canGoPrevious)
+            player.previous();
+    }
+
+    function next() {
+        if (canGoNext)
+            player.next();
+    }
+
+    function seekTo(ratio) {
+        if (!canSetPosition || lengthSec <= 0)
+            return;
+        const target = Math.max(0, Math.min(1, ratio)) * lengthSec;
+        player.position = target;
+    }
+
+    // Applied live during the drag rather than on release: changing volume
+    // is cheap and gives immediate feedback, unlike a seek.
+    function setVolume(ratio) {
+        if (!canSetVolume)
+            return;
+        player.volume = Math.max(0, Math.min(1, ratio));
+    }
+
+    function toggleShuffle() {
+        if (!canToggleShuffle)
+            return;
+        player.shuffle = player.shuffle !== true;
+    }
+
+    // Off -> repeat this track -> repeat the whole queue -> off.
+    function cycleLoop() {
+        if (!canCycleLoop)
+            return;
+        const now = player.loopState;
+        if (now === MprisLoopState.Track)
+            player.loopState = MprisLoopState.Playlist;
+        else if (now === MprisLoopState.Playlist)
+            player.loopState = MprisLoopState.None;
+        else
+            player.loopState = MprisLoopState.Track;
+    }
+
+    /* =================================================================
+     * Window
+     * ================================================================= */
+
     PanelWindow {
-        id: pin
+        id: card
 
-        // ============================================================
-        // OPTIONS
-        // ============================================================
+        visible: root.hasPlayer
 
-        // Card background opacity.
-        //   0.0 = fully transparent (only the art, text and buttons show)
-        //   1.0 = solid
-        // Text, album art and buttons always stay fully opaque.
-        property real cardOpacity: 0.75
-
-        // Show the seek bar and timestamps. Set to false for an even
-        // more minimal card.
-        property bool showSeekBar: true
-
-        // How far the card bulges out of the background.
-        //   0.0 = flat (no shading), 1.0 = default, 2.0 = strong
-        // It fades along with cardOpacity, so a fully transparent card
-        // has no shadows either.
-        property real bulge: 0.5
-
-        // The card only shows while something is playing. When playback
-        // stops, or is paused from somewhere else (media keys, the player
-        // itself), it hides after this many milliseconds (the delay stops
-        // it flickering away between tracks). Pausing with the card's own
-        // play/pause button keeps it on screen so you can resume.
-        property int hideDelay: 2500
-
-        // Lock button visibility.
-        //   false = the lock button only appears while the pointer is
-        //           over it (plus `lockHoverPad` px of slack around it)
-        //   true  = it appears whenever the pointer is anywhere over the
-        //           card (and stays while you move onto it)
-        property bool lockOnCardHover: false
-
-        // Extra pixels around the 26px lock button that also count as
-        // "over the button" (only used when lockOnCardHover is false).
-        // Raise it if the button is fiddly to trigger.
-        property int lockHoverPad: 8
-
-        // Set to true to log pointer position / hover state to the
-        // Quickshell log (helps if the button ever fails to show).
-        property bool debugLock: false
- 
-        // Keep the card on screen even when nothing is playing, as long as
-        // a media player exists (it then shows the last / paused track).
-        property bool alwaysShow: false
-
-        // Spin the CD (and counter-spin the dashed orbit) while playing.
-        property bool spinCD: true
-
-        // Mouse wheel over the card changes the player's volume by this
-        // much per notch (0..1 scale). Wheel over the seek bar seeks by
-        // `seekStep` seconds per notch instead.
-        property real volumeStep: 0.05
-        property int seekStep: 5
-
-        // Shuffle / repeat buttons flanking prev / next (they dim if the
-        // player doesn't support them).
-        property bool showModeButtons: true
-
-        // Dragging keeps the card inside the screen and snaps it to the
-        // screen edges (`edgeGap` px in) when within `snapDistance` px.
-        property bool clampToScreen: false
-        property int snapDistance: 14
-        property int edgeGap: 16
-
-
-        // ============================================================
-        // WINDOW / POSITION
-        // ============================================================
-
-        anchors {
-            top: true
-            left: true
-        }
-
-        // The window is bigger than the card so the soft shadows have
-        // room to spread. The card itself still sits at top 200 /
-        // left 460: these margins are that position minus `pad`.
-        readonly property int pad: 28
-
-        margins {
-            top: 172
-            left: 432
-        }
-
-        readonly property int cardWidth: 500
-        readonly property int cardHeight: showSeekBar ? 186 : 168
-
-        implicitWidth: cardWidth + pad * 2
-        implicitHeight: cardHeight + pad * 2
-
-        // Only the card takes mouse input; the transparent shadow
-        // margin lets clicks fall through to the desktop.
-        //
-        // This is a FIXED rectangle on purpose. `Region { item: card }`
-        // maps the card through its parents' transforms, but Quickshell
-        // only recomputes it when the card's own x/y/width/height change,
-        // not when `stage` scales during the pop-in animation. The mask
-        // therefore got stuck at the small size it had while the card was
-        // still shrunk (scale 0.6), which left the card's edges and
-        // corners (including the lock button) outside the input region:
-        // the compositor never sent hover events there.
-        mask: Region {
-            x: pin.pad
-            y: pin.pad
-            width: pin.cardWidth
-            height: pin.cardHeight
-        }
+        WlrLayershell.layer: WlrLayer.Bottom
+        WlrLayershell.exclusionMode: ExclusionMode.Ignore
+        WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+        WlrLayershell.namespace: "mpris-pin"
 
         color: "transparent"
 
-        exclusiveZone: -1
-        focusable: false
-
-        WlrLayershell.layer: WlrLayer.Bottom
-        WlrLayershell.namespace: "mpris-pin"
-
-
-        // ============================================================
-        // COLORS
-        // ============================================================
-
-        // Live caelestia theme.
-        //
-        // caelestia writes its active scheme to
-        //   $XDG_STATE_HOME/caelestia/scheme.json
-        // (default ~/.local/state/caelestia/scheme.json).
-        // We watch that file and re-read it whenever it changes,
-        // so every colour below updates automatically.
-
-        readonly property string stateDir:
-            Quickshell.env("XDG_STATE_HOME") ||
-            (Quickshell.env("HOME") + "/.local/state")
-
-        readonly property string schemePath:
-            stateDir + "/caelestia/scheme.json"
-
-        // "colours" object from scheme.json (hex strings, no '#').
-        property var sch: ({})
-
-        // Returns "#rrggbb" for a scheme colour, or the fallback
-        // (your current scheme) until the file has been loaded.
-        function schemeColour(name, fallback) {
-            const v = sch[name]
-            return v ? "#" + v : fallback
+        // PanelWindow anchors only understand left/right/top/bottom -- there
+        // is no horizontalCenter -- so centring is done by deriving the left
+        // margin from the screen width. That also makes the card follow the
+        // monitor when it is resized or moved.
+        anchors {
+            bottom: true
+            left: true
         }
-
-        FileView {
-            id: schemeFile
-
-            path: pin.schemePath
-
-            watchChanges: true
-
-            onFileChanged: reload()
-
-            onLoaded: {
-                try {
-                    const data = JSON.parse(text())
-
-                    if (data && data.colours)
-                        pin.sch = data.colours
-                } catch (e) {
-                    // Can happen if we read while caelestia is
-                    // mid-write; keep the old colours, the next
-                    // change event will fix it.
-                    console.warn(
-                        "[mprispin] could not parse scheme.json:",
-                        e
-                    )
-                }
-            }
-
-            onLoadFailed: (error) => {
-                console.warn(
-                    "[mprispin] could not read",
-                    pin.schemePath
-                )
-            }
+        margins.left: {
+            const w = card.screen ? card.screen.width : 0;
+            return w > 0 ? Math.max(0, Math.round((w - root.cardWidth) / 2)) : 0;
         }
+        margins.bottom: root.bottomInset
 
-        // Accent / text colours
-        readonly property color colGold:
-            schemeColour("primary", "#d7c688")
+        implicitWidth: root.cardWidth
+        implicitHeight: root.cardHeight
 
-        readonly property color colOnGold:
-            schemeColour("onPrimary", "#4b400f")
+        // ---------------- background card ----------------
 
-        readonly property color colCream:
-            schemeColour("onSurface", "#ede5d1")
-
-        readonly property color colDim:
-            schemeColour("onSurfaceVariant", "#b2ab99")
-
-        readonly property color colTrack:
-            schemeColour("outlineVariant", "#4c4839")
-
-        // Card background: the scheme's dark surfaces with a
-        // subtle wash of the primary colour so it isn't flat black.
-        readonly property color colSurfaceHigh:
-            schemeColour("surfaceContainerHigh", "#0b0904")
-
-        readonly property color colSurfaceHighest:
-            schemeColour("surfaceContainerHighest", "#0d0b05")
-
-        readonly property color colBgTop:
-            Qt.tint(colSurfaceHighest, Qt.alpha(colGold, 0.14))
-
-        readonly property color colBgBottom:
-            Qt.tint(colSurfaceHigh, Qt.alpha(colGold, 0.07))
-
-        readonly property color colButtonBg: "#00000055"
-
-        // cardOpacity clamped to 0..1.
-        readonly property real bgAlpha:
-            Math.max(0, Math.min(1, cardOpacity))
-
-
-        // ============================================================
-        // MPRIS
-        // ============================================================
-
-        readonly property var players: Mpris.players.values
-
-        property int manualPlayerIndex: -1
-
-        readonly property MprisPlayer player: bestPlayer()
-
-        readonly property bool hasPlayer:
-            player !== null
-
-        readonly property bool isPlaying:
-            hasPlayer &&
-            player.playbackState === MprisPlaybackState.Playing
-
-
-        function bestPlayer() {
-            if (players.length === 0)
-                return null
-
-            // Manually selected player.
-            if (manualPlayerIndex >= 0 &&
-                manualPlayerIndex < players.length) {
-                return players[manualPlayerIndex]
-            }
-
-            // Prefer a local player that is playing.
-            for (const p of players) {
-                if (p.playbackState === MprisPlaybackState.Playing &&
-                    p.desktopEntry !== "") {
-                    return p
-                }
-            }
-
-            // Otherwise any playing player.
-            for (const p of players) {
-                if (p.playbackState === MprisPlaybackState.Playing)
-                    return p
-            }
-
-            // Otherwise prefer a local player.
-            for (const p of players) {
-                if (p.desktopEntry !== "")
-                    return p
-            }
-
-            return players[0]
-        }
-
-
-        // ============================================================
-        // HELPERS
-        // ============================================================
-
-        function formatTime(seconds) {
-            if (seconds === undefined ||
-                seconds === null ||
-                isNaN(seconds) ||
-                seconds < 0) {
-                return "0:00"
-            }
-
-            const total = Math.floor(seconds)
-            const minutes = Math.floor(total / 60)
-            const secs = total % 60
-
-            return minutes + ":" +
-                   (secs < 10 ? "0" : "") +
-                   secs
-        }
-
-
-        function seekTo(mouseX, width) {
-            if (!hasPlayer ||
-                player.length <= 0 ||
-                width <= 0) {
-                return
-            }
-
-            const ratio = Math.max(
-                0,
-                Math.min(1, mouseX / width)
-            )
-
-            player.position = ratio * player.length
-        }
-
-
-        function togglePlayback() {
-            if (!hasPlayer)
-                return
-
-            const p = player
-
-            if (p.playbackState === MprisPlaybackState.Playing) {
-                // Remember that this pause came from the card, so it
-                // stays visible instead of hiding (see SHOW / HIDE).
-                if (p.canPause || p.canTogglePlaying) {
-                    pausedByWidget = true
-                    pauseIntentTimer.restart()
-                }
-
-                if (p.canPause)
-                    p.pause()
-                else if (p.canTogglePlaying)
-                    p.togglePlaying()
-            } else {
-                if (p.canPlay)
-                    p.play()
-                else if (p.canTogglePlaying)
-                    p.togglePlaying()
-            }
-        }
-
-
-        // Relative move used by dragging: clamps to the screen and snaps to
-        // its edges.
-        function moveBy(dx, dy) {
-            let l = margins.left + dx
-            let t = margins.top + dy
-
-            if (clampToScreen && screen && screen.width > 0) {
-                // The card sits `pad` px inside the window.
-                const minL = edgeGap - pad
-                const maxL = screen.width - cardWidth - edgeGap - pad
-                const minT = edgeGap - pad
-                const maxT = screen.height - cardHeight - edgeGap - pad
-
-                if (Math.abs(l - minL) < snapDistance) l = minL
-                if (Math.abs(l - maxL) < snapDistance) l = maxL
-                if (Math.abs(t - minT) < snapDistance) t = minT
-                if (Math.abs(t - maxT) < snapDistance) t = maxT
-
-                l = Math.max(minL, Math.min(maxL, l))
-                t = Math.max(minT, Math.min(maxT, t))
-            }
-
-            margins.left = l
-            margins.top = t
-        }
-
-
-        function seekBy(seconds) {
-            if (!hasPlayer || !player.canSeek || player.length <= 0)
-                return
-
-            player.position = Math.max(
-                0,
-                Math.min(player.length, player.position + seconds)
-            )
-        }
-
-
-        // Small "Volume 55%" pill at the top of the card (see `toast`).
-        property string toastLabel: ""
-        property real toastValue: 0
-
-        Timer {
-            id: toastTimer
-
-            interval: 1200
-        }
-
-        function changeVolume(angleDelta) {
-            if (!hasPlayer || !player.volumeSupported)
-                return
-
-            const v = Math.max(
-                0,
-                Math.min(1, player.volume + angleDelta / 120 * volumeStep)
-            )
-
-            player.volume = v
-
-            toastValue = v
-            toastLabel = "Volume  " + Math.round(v * 100) + "%"
-            toastTimer.restart()
-        }
-
-
-        function toggleShuffle() {
-            if (hasPlayer && player.shuffleSupported)
-                player.shuffle = !player.shuffle
-        }
-
-
-        // Off -> repeat playlist -> repeat track -> off.
-        function cycleLoop() {
-            if (!hasPlayer || !player.loopSupported)
-                return
-
-            if (player.loopState === MprisLoopState.None)
-                player.loopState = MprisLoopState.Playlist
-            else if (player.loopState === MprisLoopState.Playlist)
-                player.loopState = MprisLoopState.Track
-            else
-                player.loopState = MprisLoopState.None
-        }
-
-
-        // Changes whenever the track does; restarts the info animation.
-        readonly property string trackKey:
-            hasPlayer
-            ? (player.trackTitle + "|" + player.trackArtist + "|" +
-               player.trackAlbum)
-            : ""
-
-        // Right-hand time label: total length, or time remaining.
-        property bool showRemaining: false
-
-
-        // ============================================================
-        // DEBUG
-        // ============================================================
-
-        onPlayersChanged: {
-            console.log(
-                "[mprispin] players detected:",
-                players.length
-            )
-
-            for (const p of players) {
-                console.log(
-                    "[mprispin] -",
-                    p.identity,
-                    "canControl:", p.canControl,
-                    "canPlay:", p.canPlay,
-                    "canPause:", p.canPause,
-                    "canTogglePlaying:", p.canTogglePlaying,
-                    "canGoNext:", p.canGoNext,
-                    "canGoPrevious:", p.canGoPrevious
-                )
-            }
-        }
-
-
-        // ============================================================
-        // STATE
-        // ============================================================
-
-        property bool locked: false
-
-        // Position persistence.
-        //
-        // Whenever you lock the card, its position is saved to
-        //   $XDG_STATE_HOME/mprispin/position.json
-        // (default ~/.local/state/mprispin/position.json)
-        // and restored, locked, on the next start. Delete that file to
-        // reset to the default position.
-
-        readonly property string positionPath:
-            stateDir + "/mprispin/position.json"
-
-        // The window stays hidden until the saved position has been
-        // read, so it doesn't flash at the default spot first.
-        property bool stateReady: false
-
-        // Mapped only while the position has been read AND the card is
-        // wanted (or still animating out).
-        visible: stateReady && (active || reveal > 0)
-
-
-        function toggleLock() {
-            locked = !locked
-
-            if (locked)
-                savePosition()
-        }
-
-
-        function savePosition() {
-            const data = JSON.stringify({
-                left: margins.left,
-                top: margins.top,
-                locked: true
-            })
-
-            // $1 = file, $2 = json. Written to a temp file and then
-            // moved into place, so a crash can't leave a half-written
-            // file behind.
-            Quickshell.execDetached([
-                "sh",
-                "-c",
-
-                "mkdir -p \"$(dirname \"$1\")\" && " +
-                "printf '%s' \"$2\" > \"$1.tmp\" && " +
-                "mv \"$1.tmp\" \"$1\"",
-
-                "sh",
-                positionPath,
-                data
-            ])
-        }
-
-
-        FileView {
-            id: positionFile
-
-            path: pin.positionPath
-
-            onLoaded: {
-                try {
-                    const d = JSON.parse(text())
-
-                    if (typeof d.left === "number" &&
-                        typeof d.top === "number") {
-                        pin.margins.left = d.left
-                        pin.margins.top = d.top
-
-                        if (d.locked === true)
-                            pin.locked = true
-                    }
-                } catch (e) {
-                    console.warn(
-                        "[mprispin] could not parse",
-                        pin.positionPath,
-                        e
-                    )
-                }
-
-                pin.stateReady = true
-            }
-
-            // No saved position yet (first run): just show the widget
-            // at the default spot.
-            onLoadFailed: (error) => {
-                pin.stateReady = true
-            }
-        }
-
-
-        // Safety net: never leave the widget hidden if the file read
-        // somehow never reports back.
-        Timer {
-            interval: 500
-            running: true
-
-            onTriggered: pin.stateReady = true
-        }
-
-
-        // ============================================================
-        // SHOW / HIDE
-        //
-        // `active` follows "something is playing" (hiding is delayed by
-        // hideDelay), or "paused with the card's own button".
-        // `reveal` drives the pop-in / pop-out animation:
-        // 0 = hidden, 1 = fully out, with a brief overshoot on the way
-        // in so the card swells out of the screen and settles.
-        // ============================================================
-
-        property bool active: false
-
-        property real reveal: 0
-
-        // Clamped copy used for shadow / bulge strength.
-        readonly property real lift:
-            Math.max(0, Math.min(1.3, reveal))
-
-
-        // True after the card's own button paused playback. While set,
-        // the card stays on screen even though nothing is playing.
-        // Cleared when playback resumes (from anywhere) or the player
-        // goes away.
-        property bool pausedByWidget: false
-
-        function updateActive() {
-            if (!hasPlayer)
-                pausedByWidget = false
-
-            if (isPlaying) {
-                pausedByWidget = false
-                hideTimer.stop()
-                active = true
-            } else if (pausedByWidget || (alwaysShow && hasPlayer)) {
-                hideTimer.stop()
-                active = true
-            } else {
-                hideTimer.restart()
-            }
-        }
-
-        onIsPlayingChanged: updateActive()
-
-        onHasPlayerChanged: updateActive()
-
-        onAlwaysShowChanged: updateActive()
-
-
-        // If we asked the player to pause but it's still playing shortly
-        // after (the request was ignored), drop the flag so a later
-        // pause from elsewhere hides the card as usual.
-        Timer {
-            id: pauseIntentTimer
-
-            interval: 2000
-
-            onTriggered: {
-                if (pin.isPlaying)
-                    pin.pausedByWidget = false
-            }
-        }
-
-        // Already playing when the shell starts.
-        Component.onCompleted: {
-            if (isPlaying || (alwaysShow && hasPlayer))
-                active = true
-        }
-
-        onActiveChanged: {
-            if (active) {
-                hideAnim.stop()
-                showAnim.restart()
-            } else {
-                showAnim.stop()
-                hideAnim.restart()
-            }
-        }
-
-
-        Timer {
-            id: hideTimer
-
-            interval: pin.hideDelay
-
-            onTriggered:
-                pin.active = false
-        }
-
-
-        // Pop out: fast rise, overshoots, settles.
-        NumberAnimation {
-            id: showAnim
-
-            target: pin
-            property: "reveal"
-
-            to: 1
-
-            duration: 650
-
-            easing.type:
-                Easing.OutBack
-
-            easing.overshoot: 2.2
-        }
-
-
-        // Pop back in: a small swell, then shrinks away.
-        NumberAnimation {
-            id: hideAnim
-
-            target: pin
-            property: "reveal"
-
-            to: 0
-
-            duration: 330
-
-            easing.type:
-                Easing.InBack
-        }
-
-
-        // ============================================================
-        // ALBUM ART
-        // ============================================================
-
-        readonly property string artSource: {
-            if (!hasPlayer || !player.trackArtUrl)
-                return ""
-
-            const url = String(player.trackArtUrl)
-
-            if (url.startsWith("http://") ||
-                url.startsWith("https://") ||
-                url.startsWith("file://") ||
-                url.startsWith("qrc:")) {
-                return url
-            }
-
-            return "file://" + url
-        }
-
-
-        // ============================================================
-        // POSITION UPDATE
-        // ============================================================
-
-        Timer {
-            interval: 500
-            repeat: true
-            running: pin.isPlaying
-
-            onTriggered: {
-                if (pin.hasPlayer)
-                    pin.player.positionChanged()
-            }
-        }
-
-
-        // ============================================================
-        // BULGE SHADOWS
-        //
-        // Soft shadows around the card, built from a stack of slightly
-        // different sized, faintly translucent rounded rectangles that
-        // add up to a blur. A dark one is offset down-right and a light
-        // one up-left, so the card looks like it is pushing out of the
-        // background. Rendered once into a texture (layer.enabled), so
-        // the CD animation doesn't re-draw them every frame.
-        // ============================================================
-
-        readonly property int shadowSteps: 28
-        // Grows as the card lifts out of the background.
-        readonly property real shadowOffset: 8 * lift
-
-        // Overall bulge strength (0 when flat or fully transparent).
-        readonly property real k:
-            Math.max(0, bulge) * bgAlpha * lift
-
-        // Alpha for each layer so that `steps` stacked layers add up to
-        // roughly `maxAlpha` at the densest point.
-        function layerAlpha(maxAlpha) {
-            const m = Math.max(0, Math.min(0.95, maxAlpha))
-
-            return 1 - Math.pow(1 - m, 1 / shadowSteps)
-        }
-
-
-        // Everything visible lives in `stage`, so the pop-in / pop-out
-        // animation scales and fades the card and its shadows together.
-        Item {
-            id: stage
-
+        Rectangle {
             anchors.fill: parent
+            radius: root.cornerRadius
+            color: Qt.alpha(root.colSurface, 0.94)
+            border.width: 1
+            border.color: root.colBorder
+        }
 
-            transformOrigin:
-                Item.Center
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: root.pad
+            spacing: 10
 
-            scale:
-                0.6 + 0.4 * pin.reveal
+            /* ---------------- art + text ---------------- */
 
-            opacity:
-                Math.max(0, Math.min(1, pin.reveal * 2))
-
-            // Flatten into one texture only while animating, so the
-            // fade doesn't show shadows through the card.
-            layer.enabled:
-                showAnim.running || hideAnim.running
-
-            layer.smooth: true
-
-
-            Item {
-                id: shadowLayers
-
-                anchors.fill: parent
-
-                visible: pin.k > 0
-
-                layer.enabled: true
-
-
-                // Dark shadow, down-right
-                Item {
-                    x: pin.pad + pin.shadowOffset
-                    y: pin.pad + pin.shadowOffset
-
-                    width: pin.cardWidth
-                    height: pin.cardHeight
-
-                    Repeater {
-                        model:
-                            pin.shadowSteps
-
-                        delegate: Rectangle {
-                            required property int index
-
-                            readonly property int grow:
-                                index - pin.shadowSteps / 2
-
-                            x: -grow
-                            y: -grow
-
-                            width: parent.width + grow * 2
-                            height: parent.height + grow * 2
-
-                            radius:
-                                Math.max(0, card.radius + grow)
-
-                            color:
-                                Qt.rgba(
-                                    0, 0, 0,
-                                    pin.layerAlpha(0.55 * pin.k)
-                                )
-                        }
-                    }
-                }
-
-
-                // Light glow, up-left
-                Item {
-                    x: pin.pad - pin.shadowOffset
-                    y: pin.pad - pin.shadowOffset
-
-                    width: pin.cardWidth
-                    height: pin.cardHeight
-
-                    Repeater {
-                        model:
-                            pin.shadowSteps
-
-                        delegate: Rectangle {
-                            required property int index
-
-                            readonly property int grow:
-                                index - pin.shadowSteps / 2
-
-                            x: -grow
-                            y: -grow
-
-                            width: parent.width + grow * 2
-                            height: parent.height + grow * 2
-
-                            radius:
-                                Math.max(0, card.radius + grow)
-
-                            color:
-                                Qt.alpha(
-                                    pin.colCream,
-                                    pin.layerAlpha(0.14 * pin.k)
-                                )
-                        }
-                    }
-                }
-            }
-
-
-            // ============================================================
-            // CARD
-            // ============================================================
-
-            Rectangle {
-                id: card
-
-                anchors.fill: parent
-
-                // Leave room around the card for the shadows.
-                anchors.margins: pin.pad
-
-                radius: 26
-                clip: true
-
-                // Flat mode (bulge = 0) keeps the accent outline; when
-                // bulging, the lit / shaded edges replace it.
-                border.width: pin.bulge > 0 ? 0 : 1
-                border.color: Qt.alpha(pin.colGold, 0.2 * pin.bgAlpha)
-
-                gradient: Gradient {
-                    orientation: Gradient.Vertical
-
-                    GradientStop {
-                        position: 0
-                        color: Qt.alpha(pin.colBgTop, pin.bgAlpha)
-                    }
-
-                    GradientStop {
-                        position: 1
-                        color: Qt.alpha(pin.colBgBottom, pin.bgAlpha)
-                    }
-                }
-
-
-                // ========================================================
-                // DRAG
-                // ========================================================
-
-                MouseArea {
-                    id: dragArea
-
-                    anchors.fill: parent
-
-                    // Always enabled: while locked it stops moving the
-                    // card but still handles the click-the-CD shortcut.
-
-                    property real pressX: 0
-                    property real pressY: 0
-
-                    // Total pointer travel since the press, to tell a click
-                    // from a drag.
-                    property real travel: 0
-
-                    cursorShape:
-                        pin.locked
-                        ? Qt.ArrowCursor
-                        : Qt.SizeAllCursor
-
-                    onPressed: (mouse) => {
-                        pressX = mouse.x
-                        pressY = mouse.y
-                        travel = 0
-                    }
-
-                    onPositionChanged: (mouse) => {
-                        if (!pressed)
-                            return
-
-                        const dx = mouse.x - pressX
-                        const dy = mouse.y - pressY
-
-                        travel += Math.abs(dx) + Math.abs(dy)
-
-                        if (!pin.locked)
-                            pin.moveBy(dx, dy)
-                    }
-
-                    // Clicking (not dragging) the CD toggles play / pause.
-                    onReleased: (mouse) => {
-                        if (travel > 4 || !pin.hasPlayer)
-                            return
-
-                        const c = artWrap.mapToItem(
-                            dragArea,
-                            artWrap.width / 2,
-                            artWrap.height / 2
-                        )
-
-                        const dx = mouse.x - c.x
-                        const dy = mouse.y - c.y
-
-                        if (Math.sqrt(dx * dx + dy * dy) <= 62)
-                            pin.togglePlayback()
-                    }
-                }
-
-
-                // ========================================================
-                // INNER BORDER (flat mode only)
-                // ========================================================
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
 
                 Rectangle {
-                    anchors.fill: parent
-
-                    anchors.margins: 1
-
-                    radius: parent.radius - 1
-
-                    visible: pin.bulge <= 0
-
-                    color: "transparent"
-
+                    Layout.preferredWidth: 72
+                    Layout.preferredHeight: 72
+                    radius: 10
+                    color: root.placeholderColor
                     border.width: 1
-                    border.color: Qt.rgba(1, 1, 1, 0.08 * pin.bgAlpha)
-                }
+                    border.color: root.colBorder
+                    clip: true
 
+                    // The box is square and `PreserveAspectCrop` keeps the
+                    // cover's own proportions while filling it edge to edge,
+                    // so a non-square cover is cropped rather than squashed.
+                    // `clip` keeps that crop inside the rounded corners.
+                    Image {
+                        id: art
+                        anchors.fill: parent
+                        source: root.artSource
+                        asynchronous: true
+                        fillMode: Image.PreserveAspectCrop
+                        smooth: true
+                        mipmap: true
+                        visible: status === Image.Ready
+                    }
 
-                // ========================================================
-                // BULGE SHADING
-                //
-                // Makes the face look convex, lit from the top-left: a
-                // diagonal light -> shade sweep, a thin lit bevel along the
-                // top/left edges and a shaded bevel along the bottom/right
-                // edges. ClippingRectangle keeps it inside the rounded
-                // corners.
-                // ========================================================
-
-                ClippingRectangle {
-                    id: bulgeShading
-
-                    anchors.fill: parent
-
-                    radius: card.radius
-
-                    color: "transparent"
-
-                    visible: pin.k > 0
-
-
-                    // Diagonal light -> shade sweep (lit corner: top-left)
-                    Rectangle {
+                    // Shown whenever no usable artwork is loaded.
+                    Column {
                         anchors.centerIn: parent
+                        spacing: 2
+                        visible: art.status !== Image.Ready
 
-                        width:
-                            Math.sqrt(
-                                parent.width * parent.width +
-                                parent.height * parent.height
-                            ) + 8
-
-                        height: width
-
-                        rotation: -45
-
-                        gradient: Gradient {
-                            orientation: Gradient.Vertical
-
-                            GradientStop {
-                                position: 0.0
-                                color: Qt.alpha(pin.colCream, 0.12 * pin.k)
-                            }
-
-                            GradientStop {
-                                position: 0.5
-                                color: "transparent"
-                            }
-
-                            GradientStop {
-                                position: 1.0
-                                color: Qt.rgba(0, 0, 0, 0.30 * pin.k)
-                            }
+                        Glyph {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            width: 26
+                            height: 26
+                            icon: "music"
+                            color: root.colAccent
+                        }
+                        Text {
+                            anchors.horizontalCenter: parent.horizontalCenter
+                            text: "no artwork"
+                            color: root.colDim
+                            font.pixelSize: 9
                         }
                     }
 
-
-                    // Lit bevel: top and left edges.
-                    // Each layer is a card-sized hole, shifted down-right,
-                    // inside a thick border. The border shows through as a
-                    // thin strip along the top and left edges.
-                    Repeater {
-                        model: 3
-
-                        delegate: Rectangle {
-                            required property int index
-
-                            readonly property int off: index + 1
-                            readonly property int thick: 40
-
-                            x: off - thick
-                            y: off - thick
-
-                            width: bulgeShading.width + thick * 2
-                            height: bulgeShading.height + thick * 2
-
-                            radius: card.radius + thick
-
-                            color: "transparent"
-
-                            border.width: thick
-                            border.color:
-                                Qt.alpha(pin.colCream, 0.07 * pin.k)
-                        }
-                    }
-
-
-                    // Shaded bevel: bottom and right edges
-                    Repeater {
-                        model: 3
-
-                        delegate: Rectangle {
-                            required property int index
-
-                            readonly property int off: index + 1
-                            readonly property int thick: 40
-
-                            x: -off - thick
-                            y: -off - thick
-
-                            width: bulgeShading.width + thick * 2
-                            height: bulgeShading.height + thick * 2
-
-                            radius: card.radius + thick
-
-                            color: "transparent"
-
-                            border.width: thick
-                            border.color:
-                                Qt.rgba(0, 0, 0, 0.12 * pin.k)
-                        }
-                    }
-                }
-
-
-                // ========================================================
-                // CONTENT
-                // ========================================================
-
-                RowLayout {
-                    anchors.fill: parent
-
-                    anchors.margins: 20
-
-                    spacing: 20
-
-
-                    // =================================================
-                    // CD / ALBUM ART
-                    // =================================================
+                    /* ---- level meter ----------------------------------
+                     * Sits in the artwork's free corner so it costs the
+                     * card no extra height.
+                     *
+                     * Each bar owns its own timer rather than sharing one:
+                     * a single shared timer would drive all four through
+                     * the same `children[]` array, which QML hands to JS
+                     * typed as plain `Item` -- the bars' `target`
+                     * property is simply not visible there. Per-bar timers
+                     * also stagger the periods, so the bars drift instead
+                     * of pulsing in lockstep.
+                     * ---------------------------------------------------- */
 
                     Item {
-                        id: artWrap
+                        id: eq
+                        anchors.right: parent.right
+                        anchors.bottom: parent.bottom
+                        anchors.margins: 6
+                        width: eqRow.width
+                        height: 13
 
-                        Layout.preferredWidth: 128
-                        Layout.preferredHeight: 128
+                        Row {
+                            id: eqRow
+                            anchors.bottom: parent.bottom
+                            spacing: 2
 
-                        Layout.alignment:
-                            Qt.AlignVCenter
+                            Repeater {
+                                model: 4
 
+                                delegate: Rectangle {
+                                    id: bar
+                                    required property int index
 
-                        // -------------------------------------------------
-                        // GOLD DASHED ORBIT
-                        // -------------------------------------------------
+                                    readonly property real low: 3
+                                    property real target: low
 
-                        Canvas {
-                            id: orbit
+                                    width: 3
+                                    // Resting height while paused, so the
+                                    // meter falls back to a flat line
+                                    // without needing a separate reset.
+                                    height: root.isPlaying ? target : low
+                                    radius: 1.5
+                                    color: root.colAccent
 
-                            anchors.centerIn: parent
+                                    Timer {
+                                        interval: 130 + bar.index * 41
+                                        repeat: true
+                                        running: root.isPlaying
+                                        onTriggered: bar.target = bar.low
+                                            + Math.random()
+                                            * (eq.height - bar.low)
+                                    }
 
-                            width: parent.width + 14
-                            height: parent.height + 14
-
-                            // Slow counter-rotation, opposite to the CD.
-                            RotationAnimation on rotation {
-                                running: pin.isPlaying && pin.spinCD
-
-                                from: 360
-                                to: 0
-
-                                duration: 24000
-
-                                loops:
-                                    Animation.Infinite
-
-                                easing.type:
-                                    Easing.Linear
-                            }
-
-                            // Canvas doesn't repaint on its own when a
-                            // colour used inside onPaint changes.
-                            Connections {
-                                target: pin
-
-                                function onColGoldChanged() {
-                                    orbit.requestPaint()
-                                }
-                            }
-
-                            onPaint: {
-                                const ctx = getContext("2d")
-
-                                ctx.reset()
-
-                                ctx.strokeStyle =
-                                    pin.colGold
-
-                                ctx.globalAlpha = 0.65
-
-                                ctx.lineWidth = 2
-
-                                ctx.setLineDash([
-                                    3,
-                                    7
-                                ])
-
-                                ctx.beginPath()
-
-                                ctx.arc(
-                                    width / 2,
-                                    height / 2,
-                                    width / 2 - 2,
-                                    0,
-                                    Math.PI * 2
-                                )
-
-                                ctx.stroke()
-                            }
-                        }
-
-
-                        // =================================================
-                        // ROTATING CD
-                        // =================================================
-
-                        Item {
-                            id: cd
-
-                            width: 120
-                            height: 120
-
-                            anchors.centerIn: parent
-
-                            transformOrigin:
-                                Item.Center
-
-
-                            // -------------------------------------------------
-                            // Continuous CD rotation
-                            // -------------------------------------------------
-
-                            RotationAnimation on rotation {
-                                running: pin.isPlaying && pin.spinCD
-
-                                from: 0
-                                to: 360
-
-                                duration: 5000
-
-                                loops:
-                                    Animation.Infinite
-
-                                easing.type:
-                                    Easing.Linear
-                            }
-
-
-                            // =================================================
-                            // CIRCULAR ALBUM ART
-                            // ClippingRectangle clips its children to the
-                            // rounded corner radius, so radius = width / 2
-                            // gives a true circle.
-                            // =================================================
-
-                            ClippingRectangle {
-                                id: circularArtwork
-
-                                anchors.fill: parent
-
-                                radius: width / 2
-
-                                // Shown when there is no artwork.
-                                color: pin.colTrack
-
-                                Image {
-                                    id: albumArt
-
-                                    anchors.fill: parent
-
-                                    source:
-                                        pin.artSource
-
-                                    fillMode:
-                                        Image.PreserveAspectCrop
-
-                                    asynchronous: true
-                                    cache: true
-
-                                    sourceSize:
-                                        Qt.size(256, 256)
-
-                                    smooth: true
-
-                                    // Fades in when a new cover has loaded.
-                                    opacity:
-                                        status === Image.Ready
-                                        ? 1
-                                        : 0
-
-                                    Behavior on opacity {
+                                    Behavior on height {
                                         NumberAnimation {
-                                            duration: 260
+                                            duration: 170
+                                            easing.type: Easing.OutQuad
                                         }
                                     }
-                                }
-                            }
-
-
-                            // =================================================
-                            // CD EDGE
-                            // =================================================
-
-                            Rectangle {
-                                anchors.fill: parent
-
-                                radius:
-                                    width / 2
-
-                                color:
-                                    "transparent"
-
-                                border.width: 1
-
-                                border.color:
-                                    "#88ffffff"
-
-                                z: 10
-                            }
-
-
-                            // =================================================
-                            // INNER CD RINGS
-                            // =================================================
-
-                            Rectangle {
-                                anchors.fill: parent
-
-                                anchors.margins: 8
-
-                                radius:
-                                    width / 2
-
-                                color:
-                                    "transparent"
-
-                                border.width: 1
-
-                                border.color:
-                                    "#35ffffff"
-
-                                opacity: 0.65
-
-                                z: 11
-                            }
-
-
-                            Rectangle {
-                                anchors.fill: parent
-
-                                anchors.margins: 20
-
-                                radius:
-                                    width / 2
-
-                                color:
-                                    "transparent"
-
-                                border.width: 1
-
-                                border.color:
-                                    "#25ffffff"
-
-                                opacity: 0.6
-
-                                z: 11
-                            }
-
-
-                            Rectangle {
-                                anchors.fill: parent
-
-                                anchors.margins: 34
-
-                                radius:
-                                    width / 2
-
-                                color:
-                                    "transparent"
-
-                                border.width: 1
-
-                                border.color:
-                                    "#18ffffff"
-
-                                opacity: 0.5
-
-                                z: 11
-                            }
-
-
-                            // =================================================
-                            // CD REFLECTION
-                            // =================================================
-
-                            Rectangle {
-                                anchors.fill: parent
-
-                                radius:
-                                    width / 2
-
-                                color:
-                                    "transparent"
-
-                                opacity: 0.16
-
-                                z: 12
-
-                                gradient: Gradient {
-                                    orientation:
-                                        Gradient.Vertical
-
-                                    GradientStop {
-                                        position: 0.0
-                                        color: "#ffffff"
-                                    }
-
-                                    GradientStop {
-                                        position: 0.38
-                                        color: "#00ffffff"
-                                    }
-
-                                    GradientStop {
-                                        position: 1.0
-                                        color: "#000000"
-                                    }
-                                }
-                            }
-
-
-                            // =================================================
-                            // CENTER LABEL
-                            // =================================================
-
-                            Rectangle {
-                                id: cdCenter
-
-                                width: 30
-                                height: 30
-
-                                radius: 15
-
-                                anchors.centerIn:
-                                    parent
-
-                                color:
-                                    pin.colBgBottom
-
-                                border.width: 1
-
-                                border.color:
-                                    Qt.alpha(pin.colGold, 0.47)
-
-                                z: 20
-
-
-                                // Center hole
-                                Rectangle {
-                                    width: 9
-                                    height: 9
-
-                                    radius: 4.5
-
-                                    anchors.centerIn:
-                                        parent
-
-                                    color:
-                                        "#070605"
-
-                                    border.width: 1
-
-                                    border.color:
-                                        "#80ffffff"
-                                }
-                            }
-                        }
-                    }
-
-
-                    // =================================================
-                    // INFO + CONTROLS
-                    // =================================================
-
-                    ColumnLayout {
-                        Layout.fillWidth: true
-                        Layout.fillHeight: true
-
-                        spacing: 8
-
-
-                        // -------------------------------------------------
-                        // TRACK INFO
-                        // -------------------------------------------------
-
-                        ColumnLayout {
-                            id: trackInfo
-
-                            Layout.fillWidth: true
-
-                            spacing: 3
-
-                            // Slide + fade in whenever the track changes.
-                            transform: Translate {
-                                id: trackShift
-                            }
-
-                            ParallelAnimation {
-                                id: trackAnim
-
-                                NumberAnimation {
-                                    target: trackInfo
-                                    property: "opacity"
-                                    from: 0
-                                    to: 1
-                                    duration: 320
-                                }
-
-                                NumberAnimation {
-                                    target: trackShift
-                                    property: "x"
-                                    from: -16
-                                    to: 0
-                                    duration: 380
-                                    easing.type: Easing.OutCubic
-                                }
-                            }
-
-                            Connections {
-                                target: pin
-
-                                function onTrackKeyChanged() {
-                                    trackAnim.restart()
-                                }
-                            }
-
-
-                            Text {
-                                Layout.fillWidth: true
-
-                                text:
-                                    pin.hasPlayer
-                                    ? (
-                                        pin.player.trackTitle ||
-                                        "Unknown Title"
-                                    )
-                                    : "Nothing playing"
-
-                                color:
-                                    pin.colCream
-
-                                font.pixelSize: 19
-                                font.bold: true
-
-                                elide:
-                                    Text.ElideRight
-                            }
-
-
-                            Text {
-                                Layout.fillWidth: true
-
-                                text:
-                                    pin.hasPlayer
-                                    ? (
-                                        pin.player.trackArtist ||
-                                        "Unknown Artist"
-                                    )
-                                    : "Open a media player"
-
-                                color:
-                                    pin.colDim
-
-                                font.pixelSize: 13
-
-                                elide:
-                                    Text.ElideRight
-                            }
-
-
-                            Text {
-                                Layout.fillWidth: true
-
-                                visible:
-                                    pin.hasPlayer &&
-                                    pin.player.trackAlbum !== ""
-
-                                text:
-                                    pin.hasPlayer
-                                    ? pin.player.trackAlbum
-                                    : ""
-
-                                color:
-                                    pin.colDim
-
-                                opacity: 0.75
-
-                                font.pixelSize: 11
-
-                                elide:
-                                    Text.ElideRight
-                            }
-                        }
-
-
-                        Item {
-                            Layout.fillHeight: true
-                            Layout.minimumHeight: 0
-                        }
-
-
-                        // =================================================
-                        // SEEK BAR (optional, see showSeekBar)
-                        // =================================================
-
-                        RowLayout {
-                            Layout.fillWidth: true
-
-                            visible:
-                                pin.showSeekBar
-
-                            spacing: 10
-
-
-                            Text {
-                                text:
-                                    pin.hasPlayer
-                                    ? pin.formatTime(
-                                        pin.player.position
-                                    )
-                                    : "0:00"
-
-                                color:
-                                    pin.colDim
-
-                                font.pixelSize: 11
-                            }
-
-
-                            Item {
-                                id: seek
-
-                                Layout.fillWidth: true
-
-                                implicitHeight: 14
-
-                                // Grows while hovered / dragged.
-                                readonly property bool hot:
-                                    seekMouse.containsMouse ||
-                                    seekMouse.pressed
-
-                                property real thick:
-                                    hot ? 6 : 4
-
-                                Behavior on thick {
-                                    NumberAnimation {
-                                        duration: 120
-                                    }
-                                }
-
-
-                                readonly property real ratio:
-                                    (
-                                        pin.hasPlayer &&
-                                        pin.player.length > 0
-                                    )
-                                    ? Math.max(
-                                        0,
-                                        Math.min(
-                                            1,
-                                            pin.player.position /
-                                            pin.player.length
-                                        )
-                                    )
-                                    : 0
-
-
-                                Rectangle {
-                                    anchors.verticalCenter:
-                                        parent.verticalCenter
-
-                                    width:
-                                        parent.width
-
-                                    height: seek.thick
-
-                                    radius: seek.thick / 2
-
-                                    color:
-                                        pin.colTrack
-                                }
-
-
-                                Rectangle {
-                                    anchors.verticalCenter:
-                                        parent.verticalCenter
-
-                                    width:
-                                        parent.width *
-                                        seek.ratio
-
-                                    height: seek.thick
-
-                                    radius: seek.thick / 2
-
-                                    color:
-                                        pin.colGold
-                                }
-
-
-                                Rectangle {
-                                    width: seek.hot ? 14 : 12
-                                    height: width
-
-                                    radius: width / 2
-
-                                    color:
-                                        pin.colCream
-
-                                    anchors.verticalCenter:
-                                        parent.verticalCenter
-
-                                    x:
-                                        Math.max(
-                                            0,
-                                            Math.min(
-                                                parent.width - width,
-                                                parent.width *
-                                                seek.ratio -
-                                                width / 2
-                                            )
-                                        )
-
-                                    visible:
-                                        pin.hasPlayer
-                                }
-
-
-                                // Time bubble that follows the pointer.
-                                Rectangle {
-                                    visible:
-                                        seekMouse.containsMouse &&
-                                        pin.hasPlayer &&
-                                        pin.player.length > 0
-
-                                    width: bubbleText.implicitWidth + 14
-                                    height: 18
-
-                                    radius: 9
-
-                                    color: "#c8000000"
-
-                                    y: -height - 3
-
-                                    x:
-                                        Math.max(
-                                            0,
-                                            Math.min(
-                                                seek.width - width,
-                                                seekMouse.mouseX - 6 -
-                                                width / 2
-                                            )
-                                        )
-
-                                    Text {
-                                        id: bubbleText
-
-                                        anchors.centerIn: parent
-
-                                        text:
-                                            pin.formatTime(
-                                                Math.max(
-                                                    0,
-                                                    Math.min(
-                                                        1,
-                                                        (seekMouse.mouseX - 6) /
-                                                        Math.max(1, seek.width)
-                                                    )
-                                                ) * (
-                                                    pin.hasPlayer
-                                                    ? pin.player.length
-                                                    : 0
-                                                )
-                                            )
-
-                                        color: pin.colCream
-
-                                        font.pixelSize: 10
-                                    }
-                                }
-
-
-                                MouseArea {
-                                    id: seekMouse
-
-                                    anchors.fill: parent
-
-                                    anchors.margins: -6
-
-                                    hoverEnabled: true
-
-                                    enabled:
-                                        pin.hasPlayer &&
-                                        pin.player.canSeek &&
-                                        pin.player.length > 0
-
-                                    // Wheel over the bar seeks instead of
-                                    // changing the volume.
-                                    WheelHandler {
-                                        acceptedDevices:
-                                            PointerDevice.Mouse |
-                                            PointerDevice.TouchPad
-
-                                        onWheel: (event) => {
-                                            pin.seekBy(
-                                                event.angleDelta.y > 0
-                                                ? pin.seekStep
-                                                : -pin.seekStep
-                                            )
-                                        }
-                                    }
-
-                                    // mouse.x - 6 undoes the -6 margin.
-                                    onPressed: (mouse) => {
-                                        pin.seekTo(
-                                            mouse.x - 6,
-                                            seek.width
-                                        )
-                                    }
-
-                                    onPositionChanged: (mouse) => {
-                                        if (pressed) {
-                                            pin.seekTo(
-                                                mouse.x - 6,
-                                                seek.width
-                                            )
-                                        }
-                                    }
-                                }
-                            }
-
-
-                            Text {
-                                // Click to switch between total length and
-                                // time remaining.
-                                text:
-                                    !pin.hasPlayer
-                                    ? "0:00"
-                                    : (
-                                        pin.showRemaining
-                                        ? "-" + pin.formatTime(
-                                            pin.player.length -
-                                            pin.player.position
-                                        )
-                                        : pin.formatTime(
-                                            pin.player.length
-                                        )
-                                    )
-
-                                color:
-                                    pin.colDim
-
-                                font.pixelSize: 11
-
-                                Layout.minimumWidth: 34
-
-                                horizontalAlignment:
-                                    Text.AlignRight
-
-                                MouseArea {
-                                    anchors.fill: parent
-
-                                    anchors.margins: -4
-
-                                    cursorShape:
-                                        Qt.PointingHandCursor
-
-                                    onClicked:
-                                        pin.showRemaining =
-                                            !pin.showRemaining
-                                }
-                            }
-                        }
-
-
-                        // =================================================
-                        // BUTTONS  (previous / play-pause / next)
-                        // =================================================
-
-                        RowLayout {
-                            Layout.alignment:
-                                Qt.AlignHCenter
-
-                            spacing: 14
-
-
-                            // -------------------------------------------------
-                            // Shuffle
-                            // -------------------------------------------------
-
-                            Rectangle {
-                                visible:
-                                    pin.showModeButtons
-
-                                Layout.preferredWidth: 28
-                                Layout.preferredHeight: 28
-
-                                radius: 14
-
-                                color:
-                                    (
-                                        pin.hasPlayer &&
-                                        pin.player.shuffle
-                                    )
-                                    ? Qt.alpha(pin.colGold, 0.28)
-                                    : pin.colButtonBg
-
-
-                                Text {
-                                    anchors.centerIn:
-                                        parent
-
-                                    text: "⇄"
-
-                                    font.pixelSize: 13
-
-                                    color:
-                                        (
-                                            pin.hasPlayer &&
-                                            pin.player.shuffle
-                                        )
-                                        ? pin.colGold
-                                        : pin.colCream
-
-                                    opacity:
-                                        (
-                                            pin.hasPlayer &&
-                                            pin.player.shuffleSupported
-                                        )
-                                        ? 1
-                                        : 0.3
-                                }
-
-
-                                MouseArea {
-                                    anchors.fill:
-                                        parent
-
-                                    enabled:
-                                        pin.hasPlayer &&
-                                        pin.player.shuffleSupported
-
-                                    onClicked:
-                                        pin.toggleShuffle()
-                                }
-                            }
-
-
-                            // -------------------------------------------------
-                            // Previous
-                            // -------------------------------------------------
-
-                            Rectangle {
-                                Layout.preferredWidth: 32
-                                Layout.preferredHeight: 32
-
-                                radius: 16
-
-                                color:
-                                    pin.colButtonBg
-
-
-                                Text {
-                                    anchors.centerIn:
-                                        parent
-
-                                    text: "◀◀"
-
-                                    font.pixelSize: 10
-
-                                    color:
-                                        pin.colCream
-
-                                    opacity:
-                                        (
-                                            pin.hasPlayer &&
-                                            pin.player.canGoPrevious
-                                        )
-                                        ? 1
-                                        : 0.35
-                                }
-
-
-                                MouseArea {
-                                    anchors.fill:
-                                        parent
-
-                                    enabled:
-                                        pin.hasPlayer &&
-                                        pin.player.canGoPrevious
-
-                                    onClicked:
-                                        pin.player.previous()
-                                }
-                            }
-
-
-                            // -------------------------------------------------
-                            // Play / Pause
-                            // -------------------------------------------------
-
-                            Rectangle {
-                                Layout.preferredWidth: 42
-                                Layout.preferredHeight: 42
-
-                                radius: 21
-
-                                color:
-                                    pin.colGold
-
-                                opacity:
-                                    (
-                                        pin.hasPlayer &&
-                                        (
-                                            pin.player.canPlay ||
-                                            pin.player.canPause ||
-                                            pin.player.canTogglePlaying
-                                        )
-                                    )
-                                    ? 1
-                                    : 0.4
-
-
-                                Text {
-                                    anchors.centerIn:
-                                        parent
-
-                                    anchors.horizontalCenterOffset:
-                                        pin.isPlaying ? 0 : 1
-
-                                    text:
-                                        pin.isPlaying
-                                        ? "❚❚"
-                                        : "▶"
-
-                                    font.pixelSize: 15
-
-                                    color:
-                                        pin.colOnGold
-                                }
-
-
-                                MouseArea {
-                                    anchors.fill:
-                                        parent
-
-                                    enabled:
-                                        pin.hasPlayer &&
-                                        (
-                                            pin.player.canPlay ||
-                                            pin.player.canPause ||
-                                            pin.player.canTogglePlaying
-                                        )
-
-                                    onClicked:
-                                        pin.togglePlayback()
-                                }
-                            }
-
-
-                            // -------------------------------------------------
-                            // Next
-                            // -------------------------------------------------
-
-                            Rectangle {
-                                Layout.preferredWidth: 32
-                                Layout.preferredHeight: 32
-
-                                radius: 16
-
-                                color:
-                                    pin.colButtonBg
-
-
-                                Text {
-                                    anchors.centerIn:
-                                        parent
-
-                                    text: "▶▶"
-
-                                    font.pixelSize: 10
-
-                                    color:
-                                        pin.colCream
-
-                                    opacity:
-                                        (
-                                            pin.hasPlayer &&
-                                            pin.player.canGoNext
-                                        )
-                                        ? 1
-                                        : 0.35
-                                }
-
-
-                                MouseArea {
-                                    anchors.fill:
-                                        parent
-
-                                    enabled:
-                                        pin.hasPlayer &&
-                                        pin.player.canGoNext
-
-                                    onClicked:
-                                        pin.player.next()
-                                }
-                            }
-
-
-                            // -------------------------------------------------
-                            // Repeat (off -> playlist -> track)
-                            // -------------------------------------------------
-
-                            Rectangle {
-                                id: repeatButton
-
-                                visible:
-                                    pin.showModeButtons
-
-                                readonly property bool on:
-                                    pin.hasPlayer &&
-                                    pin.player.loopState !==
-                                        MprisLoopState.None
-
-                                Layout.preferredWidth: 28
-                                Layout.preferredHeight: 28
-
-                                radius: 14
-
-                                color:
-                                    on
-                                    ? Qt.alpha(pin.colGold, 0.28)
-                                    : pin.colButtonBg
-
-
-                                Text {
-                                    anchors.centerIn:
-                                        parent
-
-                                    text: "↻"
-
-                                    font.pixelSize: 14
-
-                                    color:
-                                        repeatButton.on
-                                        ? pin.colGold
-                                        : pin.colCream
-
-                                    opacity:
-                                        (
-                                            pin.hasPlayer &&
-                                            pin.player.loopSupported
-                                        )
-                                        ? 1
-                                        : 0.3
-                                }
-
-
-                                // "1" badge when repeating a single track
-                                Text {
-                                    visible:
-                                        pin.hasPlayer &&
-                                        pin.player.loopState ===
-                                            MprisLoopState.Track
-
-                                    anchors.centerIn:
-                                        parent
-
-                                    text: "1"
-
-                                    font.pixelSize: 7
-                                    font.bold: true
-
-                                    color:
-                                        pin.colGold
-                                }
-
-
-                                MouseArea {
-                                    anchors.fill:
-                                        parent
-
-                                    enabled:
-                                        pin.hasPlayer &&
-                                        pin.player.loopSupported
-
-                                    onClicked:
-                                        pin.cycleLoop()
                                 }
                             }
                         }
                     }
                 }
 
-
-                // ============================================================
-                // SOURCE SWITCHER
-                // ============================================================
-
-                Rectangle {
-                    id: sourceSwitcher
-
-                    visible:
-                        pin.players.length > 1
-
-                    anchors.top:
-                        parent.top
-
-                    anchors.left:
-                        parent.left
-
-                    anchors.margins: 10
-
-                    radius: 10
-
-                    color:
-                        "#00000066"
-
-                    implicitHeight: 20
-
-                    implicitWidth:
-                        srcLabel.implicitWidth + 16
-
+                ColumnLayout {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    spacing: 2
 
                     Text {
-                        id: srcLabel
-
-                        anchors.centerIn:
-                            parent
-
-                        text:
-                            pin.hasPlayer
-                            ? (
-                                (
-                                    pin.player.desktopEntry ||
-                                    pin.player.identity
-                                ) +
-                                "  " +
-                                (
-                                    pin.players.indexOf(
-                                        pin.player
-                                    ) + 1
-                                ) +
-                                "/" +
-                                pin.players.length
-                            )
-                            : ""
-
-                        color:
-                            pin.colDim
-
-                        font.pixelSize: 10
+                        Layout.fillWidth: true
+                        text: root.trackTitle
+                        color: root.colText
+                        font.pixelSize: 14
+                        font.weight: Font.DemiBold
+                        // Elide instead of letting long titles overflow the
+                        // card and collide with the controls.
+                        elide: Text.ElideRight
+                        maximumLineCount: 1
                     }
 
-
-                    MouseArea {
-                        anchors.fill:
-                            parent
-
-                        cursorShape:
-                            Qt.PointingHandCursor
-
-                        onClicked: {
-                            const count =
-                                pin.players.length
-
-                            if (count === 0)
-                                return
-
-                            const current =
-                                pin.manualPlayerIndex >= 0
-                                ? pin.manualPlayerIndex
-                                : pin.players.indexOf(
-                                    pin.player
-                                )
-
-                            pin.manualPlayerIndex =
-                                (current + 1) % count
-                        }
-                    }
-                }
-
-
-                // ============================================================
-                // LOCK BUTTON
-                // Appears when the pointer is over the button's spot in the
-                // top-right corner (see lockOnCardHover / lockHoverPad in
-                // OPTIONS). It then swells out of the surface like a raised
-                // dome: soft shadow beneath, lit from the top, with a
-                // slight overshoot as it pops out.
-                //
-                // Hover is decided from the pointer POSITION reported by one
-                // card-wide HoverHandler, instead of a hover-enabled
-                // MouseArea on the button. That way the button's own
-                // scale/fade animation can't shrink its hit area away, and
-                // no child item can steal the hover from the card.
-                // ============================================================
-
-                HoverHandler {
-                    id: cardHover
-
-                    onPointChanged: {
-                        if (pin.debugLock)
-                            console.log(
-                                "[mprispin] hover:", hovered,
-                                "x:", point.position.x,
-                                "y:", point.position.y,
-                                "lock shown:", lockButton.shown
-                            )
-                    }
-                }
-
-
-                Item {
-                    id: lockButton
-
-                    width: 26
-                    height: 26
-
-                    anchors.top:
-                        parent.top
-
-                    anchors.right:
-                        parent.right
-
-                    anchors.margins: 10
-
-                    // True while the pointer is within `pad` px of the
-                    // button's rectangle (card coordinates).
-                    function pointerWithin(pad) {
-                        if (!cardHover.hovered)
-                            return false
-
-                        const p = cardHover.point.position
-
-                        return p.x >= x - pad &&
-                               p.x <= x + width + pad &&
-                               p.y >= y - pad &&
-                               p.y <= y + height + pad
+                    Text {
+                        Layout.fillWidth: true
+                        text: root.trackArtist
+                        color: root.colDim
+                        font.pixelSize: 12
+                        elide: Text.ElideRight
+                        maximumLineCount: 1
                     }
 
-                    readonly property bool shown:
-                        pin.lockOnCardHover
-                        ? cardHover.hovered
-                        : (
-                            pointerWithin(pin.lockHoverPad) ||
-                            lockClick.containsMouse
-                        )
+                    // Player switcher, only when it would be useful.
+                    Row {
+                        Layout.fillWidth: true
+                        spacing: 4
+                        visible: root.allPlayers.length > 1
 
-                    // Pointer is directly over the button itself.
-                    readonly property bool overButton:
-                        pointerWithin(0) ||
-                        lockClick.containsMouse
+                        Repeater {
+                            model: root.allPlayers
 
-                    // Starts small and flat, swells past full size, settles.
-                    // Dips slightly while pressed.
-                    scale:
-                        !shown
-                        ? 0.55
-                        : (
-                            lockClick.pressed
-                            ? 0.93
-                            : 1.0
-                        )
+                            delegate: Rectangle {
+                                required property int index
+                                required property var modelData
 
-                    opacity:
-                        shown
-                        ? 1.0
-                        : 0.0
+                                readonly property bool active: root.player === modelData
 
-                    Behavior on scale {
-                        NumberAnimation {
-                            duration: 300
+                                width: label.implicitWidth + 12
+                                height: 18
+                                radius: 9
+                                color: active ? Qt.alpha(root.colAccent, 0.22) : "transparent"
+                                border.width: 1
+                                border.color: active ? Qt.alpha(root.colAccent, 0.5) : root.colBorder
 
-                            easing.type:
-                                Easing.OutBack
+                                Text {
+                                    id: label
+                                    anchors.centerIn: parent
+                                    text: (modelData.identity || "player").slice(0, 12)
+                                    color: active ? root.colText : root.colDim
+                                    font.pixelSize: 9
+                                }
 
-                            easing.overshoot: 2.2
-                        }
-                    }
-
-                    Behavior on opacity {
-                        NumberAnimation {
-                            duration: 220
-
-                            easing.type:
-                                Easing.OutQuad
-                        }
-                    }
-
-
-                    // -------------------------------------------------
-                    // Soft shadow under the bump (stacked translucent
-                    // discs, largest and faintest first)
-                    // -------------------------------------------------
-
-                    Repeater {
-                        model: [
-                            { grow: 10, alpha: 0.05 },
-                            { grow: 6,  alpha: 0.07 },
-                            { grow: 2,  alpha: 0.10 }
-                        ]
-
-                        delegate: Rectangle {
-                            required property var modelData
-
-                            anchors.centerIn:
-                                parent
-
-                            anchors.verticalCenterOffset: 2
-
-                            width:
-                                lockButton.width + modelData.grow
-
-                            height:
-                                width
-
-                            radius:
-                                width / 2
-
-                            color:
-                                Qt.rgba(0, 0, 0, modelData.alpha)
-                        }
-                    }
-
-
-                    // -------------------------------------------------
-                    // The dome: lighter at the top, darker at the bottom
-                    // -------------------------------------------------
-
-                    Rectangle {
-                        id: dome
-
-                        anchors.fill:
-                            parent
-
-                        radius:
-                            width / 2
-
-                        gradient: Gradient {
-                            orientation:
-                                Gradient.Vertical
-
-                            GradientStop {
-                                position: 0.0
-
-                                color:
-                                    Qt.tint(
-                                        pin.colSurfaceHighest,
-                                        Qt.alpha(pin.colGold, 0.32)
-                                    )
-                            }
-
-                            GradientStop {
-                                position: 1.0
-
-                                color:
-                                    Qt.tint(
-                                        pin.colSurfaceHighest,
-                                        Qt.alpha(pin.colGold, 0.12)
-                                    )
-                            }
-                        }
-
-                        border.width: 1
-
-                        border.color:
-                            Qt.rgba(
-                                1, 1, 1,
-                                lockButton.overButton
-                                ? 0.24
-                                : 0.12
-                            )
-
-
-                        // Glossy highlight near the top-left
-                        Rectangle {
-                            width: 9
-                            height: 5
-
-                            radius: 2.5
-
-                            x: 5
-                            y: 4.5
-
-                            rotation: -35
-
-                            color:
-                                Qt.rgba(1, 1, 1, 0.16)
-                        }
-
-
-                        // Padlock drawn from plain shapes so it follows the
-                        // caelestia theme (accent when locked, dim when not).
-                        Item {
-                            id: lockIcon
-
-                            width: 14
-                            height: 16
-
-                            anchors.centerIn:
-                                parent
-
-                            opacity:
-                                lockButton.overButton
-                                ? 1.0
-                                : 0.75
-
-                            readonly property color iconColor:
-                                pin.locked
-                                ? pin.colGold
-                                : pin.colDim
-
-
-                            // Shackle (drops into the body when locked,
-                            // lifts away when unlocked)
-                            Rectangle {
-                                width: 10
-                                height: 10
-
-                                radius: 5
-
-                                x: 2
-
-                                y:
-                                    pin.locked
-                                    ? 0
-                                    : -4
-
-                                color:
-                                    "transparent"
-
-                                border.width: 2
-
-                                border.color:
-                                    lockIcon.iconColor
-
-                                Behavior on y {
-                                    NumberAnimation {
-                                        duration: 140
-
-                                        easing.type:
-                                            Easing.OutQuad
-                                    }
+                                MouseArea {
+                                    anchors.fill: parent
+                                    cursorShape: Qt.PointingHandCursor
+                                    onClicked: root.manualIndex = index
                                 }
                             }
+                        }
+                    }
 
+                    Item { Layout.fillHeight: true }
+                }
+            }
 
-                            // Body
-                            Rectangle {
-                                width: 14
-                                height: 9
+            /* ---------------- seek bar ---------------- */
 
-                                radius: 2
+            ColumnLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                visible: root.canSeek && root.lengthSec > 0
 
-                                y: 7
+                // A hand-rolled bar rather than Slider: Slider writes its own
+                // `value` while dragging, which silently destroys the binding
+                // to `root.progress`, and the bar then freezes at the drag
+                // position forever. Here the fill is a plain ratio and the
+                // drag is committed only on release.
+                Item {
+                    id: seekBar
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 14
 
-                                color:
-                                    lockIcon.iconColor
-                            }
+                    readonly property real ratio: root.canSetPosition
+                        ? root.progress : 0
+                    property bool dragging: false
+                    property real dragRatio: 0
+
+                    readonly property real shown: dragging ? dragRatio : ratio
+
+                    function ratioAt(mx) {
+                        const w = Math.max(1, width);
+                        return Math.max(0, Math.min(1, mx / w));
+                    }
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: parent.width
+                        height: 4
+                        radius: 2
+                        color: Qt.alpha(root.colText, 0.16)
+                    }
+
+                    Rectangle {
+                        anchors.verticalCenter: parent.verticalCenter
+                        width: Math.max(0, parent.width * seekBar.shown)
+                        height: 4
+                        radius: 2
+                        color: root.colAccent
+                    }
+
+                    Rectangle {
+                        visible: seekBar.dragging
+                        width: 12
+                        height: 12
+                        radius: 6
+                        color: root.colAccent
+                        x: Math.max(0, Math.min(seekBar.width - width,
+                              seekBar.shown * seekBar.width - width / 2))
+                        y: (seekBar.height - height) / 2
+                    }
+
+                    MouseArea {
+                        id: seekInput
+                        anchors.fill: parent
+                        enabled: root.canSetPosition
+                        cursorShape: root.canSetPosition
+                            ? Qt.PointingHandCursor : Qt.ArrowCursor
+
+                        onPressed: function (event) {
+                            seekBar.dragging = true;
+                            seekBar.dragRatio = seekBar.ratioAt(event.x);
+                        }
+                        onPositionChanged: function (event) {
+                            if (seekBar.dragging)
+                                seekBar.dragRatio = seekBar.ratioAt(event.x);
+                        }
+                        onReleased: function (event) {
+                            if (!seekBar.dragging)
+                                return;
+                            seekBar.dragging = false;
+                            root.seekTo(seekBar.dragRatio);
+                        }
+                        onExited: {
+                            // A press that leaves the surface is still a
+                            // drag; only cancel is treated as a click.
+                        }
+                        onCanceled: {
+                            seekBar.dragging = false;
                         }
                     }
                 }
 
+                RowLayout {
+                    Layout.fillWidth: true
 
-                // -------------------------------------------------
-                // Click target for the lock button. It sits exactly on
-                // the button, above the drag area, so clicking the lock
-                // doesn't start a drag. It also reports hover, as a
-                // second way (besides the pointer position from
-                // cardHover) of knowing the pointer is on the button.
-                // -------------------------------------------------
-
-                // Mouse wheel over the card changes the volume (the seek bar
-                // has its own wheel handler that seeks instead).
-                WheelHandler {
-                    acceptedDevices:
-                        PointerDevice.Mouse |
-                        PointerDevice.TouchPad
-
-                    onWheel: (event) => {
-                        pin.changeVolume(event.angleDelta.y)
+                    Text {
+                        text: root.mmss(seekBar.dragging
+                            ? seekBar.dragRatio * root.lengthSec
+                            : root.positionSec)
+                        color: root.colDim
+                        font.pixelSize: 9
+                    }
+                    Item { Layout.fillWidth: true }
+                    Text {
+                        text: root.mmss(root.lengthSec)
+                        color: root.colDim
+                        font.pixelSize: 9
                     }
                 }
+            }
 
+            /* ---------------- transport ----------------
+             *
+             * Shuffle, repeat and volume share the transport row rather
+             * than taking rows of their own: the card's height is a fixed
+             * constant so the compositor never resizes it, and growing it
+             * by ~70px to hold three small controls would occlude far more
+             * of the desktop than it is worth. The two fillWidth spacers
+             * are still equal, so prev/play/next stay optically centred
+             * regardless of which optional controls are present.
+             */
 
-                MouseArea {
-                    id: lockClick
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
 
-                    x: lockButton.x
-                    y: lockButton.y
-
-                    width: lockButton.width
-                    height: lockButton.height
-
-                    hoverEnabled: true
-
-                    cursorShape:
-                        Qt.PointingHandCursor
-
-                    onClicked:
-                        pin.toggleLock()
+                ControlButton {
+                    visible: root.canToggleShuffle
+                    icon: "shuffle"
+                    small: true
+                    active: root.shuffleOn
+                    onTriggered: root.toggleShuffle()
+                }
+                ControlButton {
+                    visible: root.canCycleLoop
+                    icon: root.loopIcon
+                    small: true
+                    active: root.loopOn
+                    onTriggered: root.cycleLoop()
                 }
 
+                Item { Layout.fillWidth: true }
 
-                // ============================================================
-                // VOLUME TOAST
-                // ============================================================
-
-                Rectangle {
-                    id: toast
-
-                    anchors.horizontalCenter:
-                        parent.horizontalCenter
-
-                    anchors.top:
-                        parent.top
-
-                    anchors.topMargin: 10
-
-                    width: toastRow.implicitWidth + 22
-                    height: 22
-
-                    radius: 11
-
-                    color: "#b8000000"
-
-                    opacity:
-                        toastTimer.running
-                        ? 1
-                        : 0
-
-                    visible:
-                        opacity > 0
-
-                    Behavior on opacity {
-                        NumberAnimation {
-                            duration: 200
-                        }
-                    }
-
-                    Row {
-                        id: toastRow
-
-                        anchors.centerIn:
-                            parent
-
-                        spacing: 8
-
-                        Text {
-                            anchors.verticalCenter:
-                                parent.verticalCenter
-
-                            text:
-                                pin.toastLabel
-
-                            color:
-                                pin.colCream
-
-                            font.pixelSize: 11
-                        }
-
-                        Rectangle {
-                            anchors.verticalCenter:
-                                parent.verticalCenter
-
-                            width: 56
-                            height: 4
-
-                            radius: 2
-
-                            color:
-                                pin.colTrack
-
-                            Rectangle {
-                                width:
-                                    parent.width * pin.toastValue
-
-                                height:
-                                    parent.height
-
-                                radius: 2
-
-                                color:
-                                    pin.colGold
-                            }
-                        }
-                    }
+                ControlButton {
+                    visible: root.canGoPrevious
+                    icon: "skip-back"
+                    onTriggered: root.previous()
                 }
+                ControlButton {
+                    visible: root.canTogglePlay
+                    icon: root.isPlaying ? "pause" : "play"
+                    prominent: true
+                    onTriggered: root.togglePlay()
+                }
+                ControlButton {
+                    visible: root.canGoNext
+                    icon: "skip-forward"
+                    onTriggered: root.next()
+                }
+
+                Item { Layout.fillWidth: true }
+
+                Text {
+                    visible: root.canSetVolume
+                    text: "vol"
+                    color: root.colDim
+                    font.pixelSize: 8
+                }
+
+                VolumeSlider {
+                    visible: root.canSetVolume
+                    Layout.preferredWidth: 84
+                }
+            }
+        }
+    }
+
+    /* =================================================================
+     * Live wallpaper
+     *
+     * A second, independent surface in this same config. It reuses the
+     * artwork cache and the track metadata resolved above -- it downloads
+     * and resolves nothing of its own -- and renders the current track as
+     * the desktop background, with the lyrics advancing as the song plays.
+     * ================================================================= */
+
+    LiveWallpaper {
+        artSource: root.artSource
+        trackTitle: root.trackTitle
+        trackArtist: root.trackArtist
+        positionSec: root.positionSec
+        hasPlayer: root.hasPlayer
+
+        // Deliberately near-white rather than the desktop theme's
+        // foreground: the current theme's #d4be98 reads as beige against
+        // blurred artwork, and this composition calls for bright white.
+        textColor: "#f4f4f7"
+        dimColor: "#9a9aa2"
+    }
+
+    /* =================================================================
+     * Small reusable control
+     * ================================================================= */
+
+    component ControlButton: Rectangle {
+        id: btn
+
+        // A Lucide icon name, drawn as vector paths. This used to be a
+        // `glyph` string of transport characters, but those codepoints are
+        // claimed by 50-170 installed fonts each and Qt resolves a font per
+        // glyph, so one row could mix several unrelated typefaces.
+        property string icon: ""
+        property bool prominent: false
+        // A latched toggle: shuffle and repeat are *on* without anything
+        // moving, so they need a colour of their own to show it.
+        property bool active: false
+        property bool small: false
+        signal triggered()
+
+        implicitWidth: small ? 28 : 32
+        implicitHeight: small ? 28 : 32
+        radius: small ? 14 : 16
+
+        color: prominent
+            ? (hover.hovered ? Qt.lighter(root.colAccent, 1.1) : root.colAccent)
+            : (active
+               ? Qt.alpha(root.colAccent, hover.hovered ? 0.34 : 0.20)
+               : (hover.hovered ? Qt.alpha(root.colText, 0.10)
+                               : Qt.alpha(root.colText, 0.04)))
+        border.width: prominent ? 0 : 1
+        border.color: active ? Qt.alpha(root.colAccent, 0.55) : root.colBorder
+
+        readonly property color glyphColor: prominent ? root.colOnAccent
+            : (active ? root.colAccent : root.colText)
+
+        Glyph {
+            anchors.centerIn: parent
+            width: btn.prominent ? 15 : (btn.small ? 12 : 14)
+            height: width
+            icon: btn.icon
+            color: btn.glyphColor
+        }
+
+        HoverHandler {
+            id: hover
+            cursorShape: Qt.PointingHandCursor
+        }
+
+        TapHandler {
+            onTapped: btn.triggered()
+        }
+    }
+
+    /* Hand-rolled for the same reason as the seek bar: Slider writes its
+     * own `value` while dragging, which would break the binding to the
+     * player's reported volume and freeze the bar at the drag position. */
+    component VolumeSlider: Item {
+        id: vol
+
+        readonly property real ratio:
+            root.canSetVolume ? root.volumeLevel : 0
+        property bool dragging: false
+        property real dragRatio: 0
+
+        readonly property real shown: dragging ? dragRatio : ratio
+
+        implicitWidth: 84
+        implicitHeight: 20
+
+        function ratioAt(mx) {
+            const w = Math.max(1, width);
+            return Math.max(0, Math.min(1, mx / w));
+        }
+
+        Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: parent.width
+            height: 4
+            radius: 2
+            color: Qt.alpha(root.colText, 0.16)
+        }
+
+        Rectangle {
+            anchors.verticalCenter: parent.verticalCenter
+            width: Math.max(0, parent.width * vol.shown)
+            height: 4
+            radius: 2
+            color: root.colAccent
+        }
+
+        Rectangle {
+            width: 10
+            height: 10
+            radius: 5
+            color: root.colAccent
+            x: Math.max(0, Math.min(vol.width - width,
+                  vol.shown * vol.width - width / 2))
+            y: (vol.height - height) / 2
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            cursorShape: Qt.PointingHandCursor
+
+            onPressed: function (event) {
+                vol.dragging = true;
+                vol.dragRatio = vol.ratioAt(event.x);
+                root.setVolume(vol.dragRatio);
+            }
+            onPositionChanged: function (event) {
+                if (!vol.dragging)
+                    return;
+                vol.dragRatio = vol.ratioAt(event.x);
+                root.setVolume(vol.dragRatio);
+            }
+            onReleased: vol.dragging = false
+            onCanceled: vol.dragging = false
+
+            // Wheel over the slider nudges in 5% steps, so the volume is
+            // reachable without a drag.
+            onWheel: function (event) {
+                if (!root.canSetVolume)
+                    return;
+                const delta = event.angleDelta.y !== 0
+                    ? event.angleDelta.y : event.angleDelta.x;
+                root.setVolume(root.volumeLevel + (delta > 0 ? 0.05 : -0.05));
+                event.accepted = true;
             }
         }
     }

@@ -1,211 +1,617 @@
-// shell.qml — standalone ChronoWidget (stopwatch / timer) for Hyprland,
-// built on plain Quickshell. Single-file version.
-//
-// Design notes vs. the original two-file version:
-//   - DRAG FIX: dragging used to write `posX`/`posY` into a
-//     PersistentProperties object on every single pixel of movement, which
-//     forces a disk write on every frame -> visible stutter. Now the drag
-//     target is a plain, non-persisted Item; the position is only written
-//     back to the persisted store once, when the drag finishes.
-//   - RESTYLE: matches Caelestia's MPRIS/media widget — Material 3
-//     tonal / filled icon buttons with hover + press state layers and
-//     shape-morphing corners, the same colour roles (primary,
-//     secondaryContainer, onSurfaceVariant ...) and no card border.
-//   - ICONS: no emoji or unicode glyphs. Every icon is a vector path drawn
-//     by the `Glyph` component and tinted from the scheme, so it always
-//     matches the theme and needs no icon font.
-//   - MERGE: ChronoWidget is now an inline `component` inside this file,
-//     so there's only one file to ship/copy.
-//
-// This is a fully standalone module — it does NOT hook into the Caelestia
-// shell. It only *optionally* reads the colour file that
-// `caelestia scheme set` writes to, purely as a theme source. If that file
-// doesn't exist, it falls back to a built-in dark palette.
-//
-// SETUP
-//   1. Put this file in its own directory:
-//        ~/.config/quickshell/chrono/shell.qml
-//   2. Run it standalone: qs -c chrono
-//   3. To start it with Hyprland, in your Hyprland config:
-//        exec-once = qs -c chrono
-//   4. To stop/reload just this widget:
-//        qs -c chrono kill
-//        qs -c chrono -d   (restart in the foreground, for debugging)
-//   5. For real background blur, add a Hyprland layer rule:
-//        layerrule = blur, chrono-widget
-//        layerrule = ignorezero, chrono-widget
-//   6. Delete/adjust the theme-file `path` in the FileView below if you're
-//      not using Caelestia, or point it at whatever colour-scheme JSON you use.
+pragma ComponentBehavior: Bound
 
+import QtQml
 import QtQuick
-import QtQuick.Shapes
+import QtQuick.Layouts
 import Quickshell
 import Quickshell.Io
 import Quickshell.Wayland
 
+/*
+ * stopwatch — stopwatch + countdown timer for Omarchy
+ * ---------------------------------------------------
+ * A draggable corner widget that toggles between a compact countdown
+ * bubble and a full control card.
+ *
+ * RUN
+ *   quickshell -c stopwatch
+ *
+ * LAYER NOTES
+ *   The surface sits on the Bottom layer, not on Background. Background is
+ *   where the wallpaper lives, so anything drawn there competes with it and
+ *   can be covered by a wallpaper change -- this widget used to do exactly
+ *   that and vanished.
+ *
+ *   The surface size is constant in every state. A layer-shell surface that
+ *   changes size is destroyed and recreated by the compositor, which is what
+ *   produced the visible flicker while expanding. Collapsed and expanded
+ *   share one 288x300 surface and only the contents change; in the collapsed
+ *   state every input handler is bounded to the visible bubble so clicks on
+ *   the surrounding transparent area reach the desktop.
+ */
+
 ShellRoot {
-    // ---- Icon set (24x24 grid, tinted from the theme) -------------------
-    component Glyph: Item {
-        id: g
-        property string name
-        property color color: "white"
-        property real size: 22
-        property bool filled: false      // outline -> filled variant (toggles)
+    id: root
 
-        width: size; height: size
-        layer.enabled: true
-        layer.samples: 4
+    /* =================================================================
+     * Configuration
+     * ================================================================= */
 
-        // [stroked path, filled path]
-        function def(n, on) {
-            switch (n) {
-            case "play":
-                return ["", "M8 5.5v13a1 1 0 0 0 1.5.86l10.5-6.5a1 1 0 0 0 0-1.72L9.5 4.64A1 1 0 0 0 8 5.5z"];
-            case "pause":
-                return ["", "M7 5.5a1.5 1.5 0 0 1 3 0v13a1.5 1.5 0 0 1-3 0z M14 5.5a1.5 1.5 0 0 1 3 0v13a1.5 1.5 0 0 1-3 0z"];
-            case "reset":
-                return ["M8.5 5.94A7 7 0 1 0 18.06 8.5", "M20.3 7.2L15.8 9.8L16.46 5.73z"];
-            case "flag":
-                return ["M6 20.5V4", "M6.5 5h11.2a.8.8 0 0 1 .6 1.3L15.5 9.5l2.8 3.2a.8.8 0 0 1-.6 1.3H6.5z"];
-            case "pin": {
-                var head = "M9 4h6l-.8 6.2L17 13v2H7v-2l2.8-2.8z";
-                return on ? ["M12 15v5.5", head] : [head + " M12 15v5.5", ""];
-            }
-            case "swap":
-                return ["M5 8.5h14M15.5 5l3.5 3.5-3.5 3.5M19 15.5H5M8.5 12L5 15.5 8.5 19", ""];
-            case "chevron":
-                return ["M6.5 9.5l5.5 5.5 5.5-5.5", ""];
-            case "stopwatch":
-                return ["M12 21a7.5 7.5 0 1 0 0-15 7.5 7.5 0 0 0 0 15z M9.5 2.5h5 M12 2.5V6 M12 13.5l2.8-2.8", ""];
-            case "hourglass":
-                return ["M7 3.5h10 M7 20.5h10 M8 3.5c0 4.5 3 5.5 4 8.5-1 3-4 4-4 8.5 M16 3.5c0 4.5-3 5.5-4 8.5 1 3 4 4 4 8.5", ""];
-            }
-            return ["", ""];
+    // Constant surface size -- never animated, never state-dependent.
+    readonly property int panelW: 288
+    readonly property int panelH: 300
+
+    readonly property int bubbleSize: 52
+    readonly property int pad: 14
+    readonly property int radius: 16
+
+    // Keep the bubble on screen even if the display is resized.
+    readonly property int edgeMargin: 8
+
+    /* =================================================================
+     * Theme
+     * ================================================================= */
+
+    readonly property string omarchyStateDir:
+        (Quickshell.env("HOME") || "/tmp") + "/.local/state"
+    readonly property string currentThemePath:
+        omarchyStateDir + "/omarchy/current/theme"
+    readonly property string themeNamePath:
+        omarchyStateDir + "/omarchy/current/theme.name"
+
+    QtObject {
+        id: theme
+
+        // Omarchy replaces the theme directory and then writes theme.name,
+        // so theme.name is the signal that the new files are safe to read.
+        property FileView colorsFile: FileView {
+            path: root.currentThemePath + "/colors.toml"
+            watchChanges: false
+            printErrors: false
+            onLoaded: theme.setColorValues(text())
         }
-        readonly property var d: def(name, filled)
 
-        Shape {
-            width: 24; height: 24
-            scale: g.size / 24
-            transformOrigin: Item.TopLeft
+        property FileView shellFile: FileView {
+            path: root.currentThemePath + "/shell.toml"
+            watchChanges: false
+            printErrors: false
+            onLoaded: theme.setThemeShellValues(text())
+        }
 
-            ShapePath {
-                strokeColor: g.color
-                strokeWidth: 2
-                fillColor: "transparent"
-                capStyle: ShapePath.RoundCap
-                joinStyle: ShapePath.RoundJoin
-                PathSvg { path: g.d[0] || "M0 0" }
+        property FileView themeNameFile: FileView {
+            path: root.themeNamePath
+            watchChanges: true
+            printErrors: false
+            onFileChanged: theme.reloadTheme()
+        }
+
+        function reloadTheme() {
+            colorsFile.reload();
+            shellFile.reload();
+        }
+
+        property var colorValues: ({})
+        property var themeShellValues: ({})
+        property var values: ({})
+
+        // Omarchy's generated files use a small TOML subset. Keep the
+        // parser local so this module remains standalone and does not
+        // import private shell QML modules.
+        function stripComment(line) {
+            let quote = "";
+            let escaped = false;
+
+            for (let i = 0; i < line.length; i++) {
+                const ch = line.charAt(i);
+                if (quote) {
+                    if (escaped) {
+                        escaped = false;
+                    } else if (ch === "\\") {
+                        escaped = true;
+                    } else if (ch === quote) {
+                        quote = "";
+                    }
+                } else if (ch === "\"" || ch === "'") {
+                    quote = ch;
+                } else if (ch === "#") {
+                    return line.substring(0, i);
+                }
             }
-            ShapePath {
-                strokeColor: "transparent"
-                fillColor: g.color
-                PathSvg { path: g.d[1] || "M0 0" }
+
+            return line;
+        }
+
+        function parseValue(raw) {
+            const value = String(raw || "").replace(/^\s+|\s+$/g, "");
+            if (!value) return null;
+
+            const quote = value.charAt(0);
+            if (quote === "\"" || quote === "'") {
+                let escaped = false;
+                for (let i = 1; i < value.length; i++) {
+                    const ch = value.charAt(i);
+                    if (quote === "\"" && escaped) {
+                        escaped = false;
+                    } else if (quote === "\"" && ch === "\\") {
+                        escaped = true;
+                    } else if (ch === quote) {
+                        const trailing = value.substring(i + 1).replace(/^\s+|\s+$/g, "");
+                        if (trailing && trailing.charAt(0) !== "#")
+                            return null;
+                        return value.substring(1, i).replace(/\\([\\"])/g, "$1");
+                    }
+                }
+                return null;
             }
+
+            return value;
+        }
+
+        function parseToml(raw) {
+            const parsed = {};
+            let section = "";
+            const lines = String(raw || "").split(/\r?\n/);
+
+            for (let i = 0; i < lines.length; i++) {
+                const line = stripComment(lines[i]).replace(/^\s+|\s+$/g, "");
+                if (!line || line.charAt(0) === "#") continue;
+
+                const sectionMatch = line.match(/^\[([A-Za-z0-9_.-]+)\]\s*$/);
+                if (sectionMatch) {
+                    section = sectionMatch[1];
+                    continue;
+                }
+
+                const equals = line.indexOf("=");
+                if (equals < 0) continue;
+                const key = line.substring(0, equals).replace(/^\s+|\s+$/g, "");
+                if (!/^[A-Za-z0-9_-]+$/.test(key)) continue;
+
+                const value = parseValue(line.substring(equals + 1));
+                if (value === null) continue;
+                parsed[(section ? section + "." : "") + key] = value;
+            }
+
+            return parsed;
+        }
+
+        function rebuildValues() {
+            const merged = {};
+            const sources = [colorValues, themeShellValues];
+            for (let i = 0; i < sources.length; i++) {
+                const source = sources[i] || {};
+                for (const key in source) merged[key] = source[key];
+            }
+
+            // Omarchy accepts both the semantic palette and its short
+            // aliases. Mirror the aliases that are useful to color-only
+            // consumers so older themes resolve consistently too.
+            const aliases = {
+                "bg": "background",
+                "fg": "foreground",
+                "dark_bg": "dark_background",
+                "darker_bg": "darker_background",
+                "lighter_bg": "lighter_background",
+                "dark_fg": "dark_foreground",
+                "light_fg": "light_foreground",
+                "bright_fg": "bright_foreground",
+                "purple": "magenta",
+                "bright_purple": "bright_magenta"
+            };
+            for (const alias in aliases) {
+                if (merged[alias] === undefined && merged[aliases[alias]] !== undefined)
+                    merged[alias] = merged[aliases[alias]];
+            }
+
+            values = merged;
+        }
+
+        function setColorValues(raw) {
+            colorValues = parseToml(raw);
+            rebuildValues();
+        }
+
+        function setThemeShellValues(raw) {
+            themeShellValues = parseToml(raw);
+            rebuildValues();
+        }
+
+        function splitColorTokens(value) {
+            const parts = [];
+            let current = "";
+            let depth = 0;
+            let quote = "";
+
+            for (let i = 0; i < value.length; i++) {
+                const ch = value.charAt(i);
+                if (quote) {
+                    current += ch;
+                    if (ch === quote)
+                        quote = "";
+                } else if (ch === "\"" || ch === "'") {
+                    quote = ch;
+                    current += ch;
+                } else if (ch === "(") {
+                    depth++;
+                    current += ch;
+                } else if (ch === ")") {
+                    depth = Math.max(0, depth - 1);
+                    current += ch;
+                } else if (/\s/.test(ch) && depth === 0) {
+                    if (current) parts.push(current);
+                    current = "";
+                } else {
+                    current += ch;
+                }
+            }
+            if (current) parts.push(current);
+            return parts;
+        }
+
+        function firstColorToken(value) {
+            const parts = splitColorTokens(String(value || ""));
+            for (let i = 0; i < parts.length; i++) {
+                if (!/^-?\d+(?:\.\d+)?deg$/i.test(parts[i]))
+                    return parts[i];
+            }
+            return "";
+        }
+
+        function byteHex(number) {
+            const n = Math.max(0, Math.min(255, Math.round(number)));
+            return ("0" + n.toString(16)).slice(-2);
+        }
+
+        function alphaHex(value) {
+            if (value === undefined || value === null || value === "")
+                return "ff";
+            const text = String(value).trim();
+            if (text.charAt(text.length - 1) === "%") {
+                // Divide first: "50% * 2.55" lands just under 127.5 in
+                // floating point and rounds to 0x7f instead of 0x80.
+                return byteHex(parseFloat(text.substring(0, text.length - 1)) / 100 * 255);
+            }
+            const alpha = parseFloat(text);
+            return byteHex((isNaN(alpha) ? 1 : alpha) * 255);
+        }
+
+        function normalizeHex(value) {
+            let hex = String(value || "").replace(/^#/, "");
+            if (!/^[0-9a-f]+$/i.test(hex)) return "";
+
+            if (hex.length === 3 || hex.length === 4) {
+                let expanded = "";
+                for (let i = 0; i < hex.length; i++)
+                    expanded += hex.charAt(i) + hex.charAt(i);
+                hex = expanded;
+            }
+            if (hex.length === 6)
+                return "#" + hex.toLowerCase();
+            if (hex.length === 8) {
+                // Omarchy/Hyprland colors use #RRGGBBAA; QML uses
+                // #AARRGGBB for an eight-digit color literal.
+                return "#" + hex.substring(6, 8).toLowerCase() +
+                    hex.substring(0, 6).toLowerCase();
+            }
+            return "";
+        }
+
+        function normalizeColor(value) {
+            const token = String(value || "").replace(/^\s+|\s+$/g, "");
+            if (!token) return "";
+            if (token === "transparent") return "#00000000";
+
+            const hex = normalizeHex(token);
+            if (hex) return hex;
+
+            const rgb = token.match(/^rgba?\(([^)]*)\)$/i);
+            if (rgb) {
+                const parts = rgb[1].split(",").map(function (part) {
+                    return part.replace(/^\s+|\s+$/g, "");
+                });
+                if (parts.length === 1 && /^#?[0-9a-f]{6}(?:[0-9a-f]{2})?$/i.test(parts[0])) {
+                    return normalizeHex("#" + parts[0].replace(/^#/, ""));
+                }
+                if (parts.length >= 3) {
+                    // Comma-separated components are decimal, matching
+                    // Omarchy's own color conversion. The hex spelling
+                    // (for example rgba(1e1e2eff)) is handled by the
+                    // single-argument branch above, so a two-digit
+                    // decimal such as 46 must not be read as a hex pair.
+                    const r = parseFloat(parts[0].replace(/^#/, ""));
+                    const g = parseFloat(parts[1].replace(/^#/, ""));
+                    const b = parseFloat(parts[2].replace(/^#/, ""));
+                    const a = parts.length > 3 ? alphaHex(parts[3]) : "ff";
+                    if (!isNaN(r) && !isNaN(g) && !isNaN(b))
+                        return "#" + a + byteHex(r) + byteHex(g) + byteHex(b);
+                }
+            }
+
+            if (/^(?:hsl|hsla)\(/i.test(token))
+                return token;
+            return "";
+        }
+
+        function resolveToken(token, depth) {
+            if (depth > 16) return "";
+
+            const value = String(token || "").replace(/^\s+|\s+$/g, "");
+            if (!value) return "";
+
+            if (value === "text")
+                return resolveToken("foreground", depth + 1);
+            if (value === "transparent")
+                return "#00000000";
+            if (values[value] !== undefined && values[value] !== value)
+                return resolveToken(values[value], depth + 1);
+
+            // Color-only consumers use the first stop of an Omarchy
+            // shell gradient (for example, rgba(...) rgba(...) 45deg).
+            const first = firstColorToken(value);
+            if (first && first !== value)
+                return resolveToken(first, depth + 1);
+            return normalizeColor(value);
+        }
+
+        function pickColor(keys, fallback) {
+            for (let i = 0; i < keys.length; i++) {
+                const resolved = resolveToken(values[keys[i]], 0);
+                if (resolved) return resolved;
+            }
+            return fallback;
+        }
+
+        function luminance(col) {
+            return 0.299 * col.r + 0.587 * col.g + 0.114 * col.b;
+        }
+
+        readonly property color baseBackground: pickColor(["background", "color0"], "#1b1d1e")
+        readonly property color baseForeground: pickColor(["foreground", "color7"], "#c6c5bf")
+        readonly property color baseAccent: pickColor(["accent", "color4"], "#fcef0c")
+        readonly property color baseMuted: pickColor(["muted", "color8"], baseForeground)
+
+        readonly property color surface: pickColor(["popups.background", "background"], baseBackground)
+        readonly property bool dark: luminance(surface) < 0.5
+        readonly property color surfaceHigh: Qt.lighter(surface, dark ? 1.08 : 0.94)
+        readonly property color surfaceHighest: Qt.lighter(surface, dark ? 1.14 : 0.88)
+        readonly property color foreground: pickColor(["popups.text", "foreground"], baseForeground)
+        readonly property color muted: pickColor(["muted", "color8"], baseMuted)
+        readonly property color accent: baseAccent
+        readonly property color onAccent: luminance(accent) > 0.5 ? "#101015" : "#ffffff"
+    }
+
+    readonly property color colText: theme.foreground
+    readonly property color colDim: theme.muted
+    readonly property color colAccent: theme.accent
+    readonly property color colOnAccent: theme.onAccent
+    readonly property color colSurface: theme.surfaceHigh
+    readonly property color colBorder: Qt.alpha(theme.foreground, 0.12)
+
+    /* =================================================================
+     * Persisted state
+     * ================================================================= */
+
+    PersistentProperties {
+        id: mem
+        reloadableId: "stopwatch"
+
+        property int posX: 60
+        property int posY: 60
+        property bool expanded: false
+        property int mode: 0          // 0 = stopwatch, 1 = timer
+        property int timerMinutes: 5
+    }
+
+    /* =================================================================
+     * Timing
+     *
+     * Elapsed time is derived from wall-clock deltas rather than by adding
+     * a tick interval, so a late or skipped tick cannot make the clock
+     * drift away from real time.
+     * ================================================================= */
+
+    property bool running: false
+    property real bankedMs: 0        // time accumulated by previous runs
+    property real startedAt: 0       // Date.now() when the current run began
+    property var laps: []            // stopwatch lap times in ms
+
+    readonly property real nowMs: running ? (Date.now() - startedAt) : 0
+    readonly property real elapsedMs: bankedMs + nowMs
+
+    readonly property int timerTotalMs: mem.timerMinutes * 60 * 1000
+    readonly property real timerRemainingMs: Math.max(0, timerTotalMs - elapsedMs)
+    readonly property bool timerFinished: mem.mode === 1 && running
+        && timerTotalMs > 0 && timerRemainingMs <= 0
+
+    readonly property real timerProgress: {
+        if (mem.mode !== 1 || timerTotalMs <= 0)
+            return 0;
+        return Math.max(0, Math.min(1, 1 - timerRemainingMs / timerTotalMs));
+    }
+
+    // Fast enough for centiseconds without burning a core.
+    Timer {
+        id: tick
+        interval: 50
+        repeat: true
+        running: root.running
+        onTriggered: {
+            if (root.timerFinished)
+                root.stop();
         }
     }
 
-    // ---- Icon button: mirrors Caelestia's IconButton (Filled / Tonal / Text)
-    component IconBtn: Item {
-        id: b
-        required property var pal
-        property string glyph
-        property string kind: "tonal"    // "filled" | "tonal" | "text"
-        property bool toggle: false      // toggles get an active colour + filled icon
-        property bool checked: false     // active state (also morphs the corners)
-        property real glyphSize: 22
-        readonly property bool pressed: ma.pressed
-        signal clicked()
-
-        readonly property bool active: toggle && checked
-        readonly property color bgColor: kind === "text" ? "transparent"
-            : kind === "filled" ? pal.primary
-            : active ? pal.secondary : pal.secondaryContainer
-        readonly property color fgColor: kind === "filled" ? pal.onPrimary
-            : kind === "tonal" ? (active ? pal.onSecondary : pal.onSecondaryContainer)
-            : (active ? pal.primary : pal.onSurfaceVariant)
-
-        opacity: enabled ? 1 : 0.38
-
-        Rectangle {
-            id: bg
-            anchors.fill: parent
-            color: b.bgColor
-            radius: b.pressed ? 12 : b.checked ? 16 : b.height / 2
-            Behavior on radius { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
-            Behavior on color { ColorAnimation { duration: 150 } }
-        }
-        // state layer (hover 8%, press 10%, same as Caelestia)
-        Rectangle {
-            anchors.fill: parent
-            radius: bg.radius
-            color: b.fgColor
-            opacity: ma.pressed ? 0.10 : ma.containsMouse ? 0.08 : 0
-            Behavior on opacity { NumberAnimation { duration: 100 } }
-        }
-        Glyph {
-            anchors.centerIn: parent
-            name: b.glyph
-            size: b.glyphSize
-            color: b.fgColor
-            filled: !b.toggle || b.checked
-        }
-        MouseArea {
-            id: ma
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: b.clicked()
-        }
+    function start() {
+        if (running)
+            return;
+        // Restarting a finished timer restarts the full duration.
+        if (mem.mode === 1 && elapsedMs >= timerTotalMs)
+            reset();
+        startedAt = Date.now();
+        running = true;
     }
 
-    // ---- Small pill button (timer +/- steps, "Clear") -------------------
-    component Chip: Item {
-        id: c
-        required property var pal
-        property string label
-        property bool tonal: true
-        signal clicked()
-
-        implicitWidth: txt.implicitWidth + 20
-        implicitHeight: 24
-        width: implicitWidth; height: implicitHeight
-
-        Rectangle {
-            anchors.fill: parent
-            radius: height / 2
-            color: c.tonal ? c.pal.secondaryContainer : "transparent"
-        }
-        Rectangle {
-            anchors.fill: parent
-            radius: height / 2
-            color: c.tonal ? c.pal.onSecondaryContainer : c.pal.primary
-            opacity: cma.pressed ? 0.10 : cma.containsMouse ? 0.08 : 0
-        }
-        Text {
-            id: txt
-            anchors.centerIn: parent
-            text: c.label
-            color: c.pal.primary
-            font.pixelSize: 11
-            font.weight: Font.Medium
-        }
-        MouseArea {
-            id: cma
-            anchors.fill: parent
-            hoverEnabled: true
-            cursorShape: Qt.PointingHandCursor
-            onClicked: c.clicked()
-        }
+    function stop() {
+        if (!running)
+            return;
+        bankedMs += Date.now() - startedAt;
+        running = false;
     }
 
-    component ChronoWidget: PanelWindow {
-        id: root
+    function toggle() {
+        if (running)
+            stop();
+        else
+            start();
+    }
 
-        WlrLayershell.layer: WlrLayer.Background
+    function reset() {
+        running = false;
+        bankedMs = 0;
+        startedAt = 0;
+        laps = [];
+    }
+
+    function lap() {
+        if (mem.mode !== 0)
+            return;
+        laps = laps.concat([{ index: laps.length + 1, total: elapsedMs }]);
+    }
+
+    function setMode(next) {
+        if (mem.mode === next)
+            return;
+        reset();
+        mem.mode = next;
+    }
+
+    function setTimerMinutes(mins) {
+        reset();
+        mem.timerMinutes = Math.max(1, Math.min(59, mins));
+    }
+
+    /* ---- formatting ------------------------------------------------- */
+
+    function padNum(n, width) {
+        let s = String(Math.floor(Math.abs(n)));
+        while (s.length < width)
+            s = "0" + s;
+        return s;
+    }
+
+    // Stopwatch: MM:SS.cc, widening to H:MM:SS.cc past an hour.
+    readonly property string stopwatchText: {
+        const total = Math.max(0, elapsedMs);
+        const cs = Math.floor(total / 10) % 100;
+        const s = Math.floor(total / 1000) % 60;
+        const m = Math.floor(total / 60000);
+        const h = Math.floor(m / 60);
+        const body = h > 0
+            ? h + ":" + padNum(m % 60, 2) + ":" + padNum(s, 2)
+            : padNum(m, 2) + ":" + padNum(s, 2);
+        return body + "." + padNum(cs, 2);
+    }
+
+    // Timer: counts down, and is always shown as M:SS so the width is stable.
+    readonly property string timerText: {
+        const total = Math.max(0, timerRemainingMs);
+        const s = Math.floor(total / 1000);
+        return Math.floor(s / 60) + ":" + padNum(s % 60, 2);
+    }
+
+    readonly property string bubbleText: {
+        if (mem.mode === 1)
+            return timerText;
+        const total = Math.max(0, elapsedMs);
+        const s = Math.floor(total / 1000);
+        return Math.floor(s / 60) + ":" + padNum(s % 60, 2);
+    }
+
+    function delta(ms) {
+        const s = Math.max(0, ms) / 1000;
+        const m = Math.floor(s / 60);
+        return m + ":" + padNum(s % 60, 2) + "." + padNum((s * 100) % 100, 2);
+    }
+
+    // Highlights the bubble when there is something worth noticing.
+    readonly property bool alert: {
+        if (mem.mode === 1)
+            return timerFinished || (running && timerRemainingMs > 0
+                && timerRemainingMs <= 10000);
+        return running;
+    }
+
+    /* =================================================================
+     * Dragging
+     *
+     * Deltas are taken in *global* coordinates. The surface itself is what
+     * moves during a drag, so item-relative `event.x` stays pinned under
+     * the cursor and the widget would refuse to move. QQuickMouseEvent also
+     * exposes no scene coordinates, only x/y, hence the mapToGlobal hop.
+     *
+     * A press that never travels is a click, not a drag -- that distinction
+     * is what lets the bubble open on tap while still being draggable.
+     * ================================================================= */
+
+    property bool dragging: false
+    property real dragAccum: 0
+    property real dragLastX: 0
+    property real dragLastY: 0
+
+    function beginDrag(item, event) {
+        dragging = true;
+        dragAccum = 0;
+        const p = item.mapToGlobal(event.x, event.y);
+        dragLastX = p.x;
+        dragLastY = p.y;
+    }
+
+    function updateDrag(item, event) {
+        if (!dragging)
+            return;
+        const p = item.mapToGlobal(event.x, event.y);
+        const dx = p.x - dragLastX;
+        const dy = p.y - dragLastY;
+        dragLastX = p.x;
+        dragLastY = p.y;
+        dragAccum += Math.abs(dx) + Math.abs(dy);
+
+        const scr = card.screen;
+        const limitW = scr ? scr.width : 1920;
+        const limitH = scr ? scr.height : 1080;
+        // The visible bubble must stay fully on screen; the transparent
+        // part of the surface is free to hang off the edge.
+        const maxX = Math.max(root.edgeMargin,
+            limitW - root.bubbleSize - root.edgeMargin);
+        const maxY = Math.max(root.edgeMargin,
+            limitH - root.bubbleSize - root.edgeMargin);
+
+        mem.posX = Math.round(Math.max(root.edgeMargin,
+            Math.min(maxX, mem.posX + dx)));
+        mem.posY = Math.round(Math.max(root.edgeMargin,
+            Math.min(maxY, mem.posY + dy)));
+    }
+
+    function endDrag() {
+        dragging = false;
+    }
+
+    // Past a few pixels of travel it counts as a drag, not a click.
+    function wasDrag() {
+        return dragAccum > 4;
+    }
+
+    /* =================================================================
+     * Window
+     * ================================================================= */
+
+    PanelWindow {
+        id: card
+
+        WlrLayershell.layer: WlrLayer.Bottom
         WlrLayershell.exclusionMode: ExclusionMode.Ignore
         WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
-        WlrLayershell.namespace: "chrono-widget"
+        WlrLayershell.namespace: "stopwatch"
 
         color: "transparent"
 
@@ -214,545 +620,369 @@ ShellRoot {
             left: true
         }
 
-        // ---- persisted bits (survive a `qs -c` config reload) --------------
-        PersistentProperties {
-            id: mem
-            reloadableId: "chronoWidget"
-
-            property real posX: 60
-            property real posY: 60
-            property int mode: 0        // 0 = stopwatch, 1 = timer
-            property bool pinned: false
-            property int timerDurationMs: 5 * 60 * 1000
-        }
-
-        // ---- position: bound to the persisted store, dragged by delta --------
         margins.left: mem.posX
         margins.top: mem.posY
 
-        // Drag options (off by default — same behaviour as before unless
-        // you turn clampToScreen on).
-        property bool clampToScreen: false
-        property int snapDistance: 14
-        property int edgeGap: 8
+        // Fixed. See the layer notes at the top of this file.
+        implicitWidth: root.panelW
+        implicitHeight: root.panelH
 
-        // Relative move used by dragging. Mutates `margins` directly every
-        // frame (cheap, no extra binding hop through a proxy item) and
-        // never touches the persisted `mem` store mid-drag — only
-        // commitPosition() (called once, on release) writes back to disk.
-        // That's what fixes the stutter: a disk write on every pixel of
-        // movement is what caused it before.
-        function moveBy(dx, dy) {
-            var l = root.margins.left + dx;
-            var t = root.margins.top + dy;
-
-            if (clampToScreen && root.screen && root.screen.width > 0) {
-                var minL = edgeGap, maxL = root.screen.width - root.width - edgeGap;
-                var minT = edgeGap, maxT = root.screen.height - root.height - edgeGap;
-
-                if (Math.abs(l - minL) < snapDistance) l = minL;
-                if (Math.abs(l - maxL) < snapDistance) l = maxL;
-                if (Math.abs(t - minT) < snapDistance) t = minT;
-                if (Math.abs(t - maxT) < snapDistance) t = maxT;
-
-                l = Math.max(minL, Math.min(maxL, l));
-                t = Math.max(minT, Math.min(maxT, t));
-            }
-
-            root.margins.left = l;
-            root.margins.top = t;
+        // The surface is always the full panel size, so without this the
+        // collapsed widget would silently eat clicks across 288x300 of
+        // desktop. Restrict the clickable region to whatever is drawn.
+        mask: Region {
+            item: mem.expanded ? panel : bubble
         }
 
-        function commitPosition() {
-            mem.posX = root.margins.left;
-            mem.posY = root.margins.top;
-        }
+        /* ---------------- collapsed bubble ---------------- */
 
-        // ---- optional external colour scheme (Caelestia's scheme.json, or none) ----
-        readonly property string stateDir:
-            Quickshell.env("XDG_STATE_HOME") || (Quickshell.env("HOME") + "/.local/state")
-        readonly property string schemePath: stateDir + "/caelestia/scheme.json"
+        Item {
+            id: bubble
+            width: root.bubbleSize
+            height: root.bubbleSize
+            visible: !mem.expanded
 
-        QtObject {
-            id: pal
-            // Raw "colours" map from scheme.json (hex strings, no '#').
-            property var sch: ({})
+            Rectangle {
+                id: bubbleFace
+                anchors.fill: parent
+                radius: width / 2
+                color: Qt.alpha(root.colSurface, 0.94)
+                border.width: root.alert ? 2 : 1
+                border.color: root.alert
+                    ? Qt.alpha(root.colAccent, 0.9) : root.colBorder
 
-            function c(role, fallback) {
-                var v = sch[role];
-                if (v === undefined || v === null || v === "") return fallback;
-                return v.toString().charAt(0) === "#" ? v : ("#" + v);
-            }
-
-            // ---- theme polarity ---------------------------------------------
-            // Simple rule: dark card -> light text, light card -> dark text.
-            function lum(col) { return 0.299 * col.r + 0.587 * col.g + 0.114 * col.b; }
-
-            // Raw roles straight from the scheme (or the fallback palette).
-            property color background: c("background", "#1b1d24")
-            property color surface: c("surfaceContainer", c("surface", "#232530"))
-            property color surfaceHigh: c("surfaceContainerHigh", c("surfaceVariant", "#2b2e39"))
-            property color outline: c("outline", "#8b8d98")
-            property color secondary: c("secondary", "#bcc7dc")
-            property color secondaryContainer: c("secondaryContainer", "#3d4759")
-            property color rawPrimary: c("primary", "#a6c8ff")
-
-            // true when the card/disc surfaces are dark
-            readonly property bool dark: lum(surface) < 0.5
-
-            // Text drawn straight on the card / disc / lap box.
-            // (all text now uses the accent colour instead — set below)
-
-            // Accent (icons, ring, "Clear"): keep the scheme hue, but make
-            // sure it is light enough on dark cards / dark enough on light ones.
-            property color primary: dark
-                ? (lum(rawPrimary) >= 0.55 ? rawPrimary : Qt.lighter(rawPrimary, 1.0 + (0.55 - lum(rawPrimary)) * 3.5))
-                : (lum(rawPrimary) <= 0.4 ? rawPrimary : Qt.darker(rawPrimary, 1.0 + (lum(rawPrimary) - 0.4) * 3.5))
-
-            // Text on coloured buttons: pick by the button's own luminance.
-            property color onPrimary: lum(primary) > 0.5 ? "#101015" : "#ffffff"
-            property color onSecondary: lum(secondary) > 0.5 ? "#101015" : "#ffffff"
-            property color onSecondaryContainer: lum(secondaryContainer) > 0.5 ? "#101015" : "#f4f4fa"
-
-            // Text = accent colour. Secondary text is the same accent, softened.
-            property color onSurface: primary
-            property color onSurfaceVariant: Qt.rgba(primary.r, primary.g, primary.b, 0.75)
-            property color muted: onSurfaceVariant
-        }
-
-        // Watches the scheme file and reloads whenever `caelestia scheme
-        // set` (or the dynamic wallpaper-scheme writer) touches it, so
-        // every colour in `pal` updates live, in place, with no restart.
-        // Reading via onLoaded (rather than binding straight to a `text`
-        // property) means we only parse once the read has actually
-        // finished, and onLoadFailed gives us a clear signal — and a log
-        // line — when the file is missing instead of silently keeping
-        // stale colours forever.
-        FileView {
-            id: schemeFile
-            path: root.schemePath
-            watchChanges: true
-            onFileChanged: reload()
-            onLoaded: {
-                try {
-                    const data = JSON.parse(text());
-                    // Accept either `{ colours: {...} }` (Caelestia's
-                    // usual shape) or a flat `{ primary: ..., ... }` file.
-                    pal.sch = (data && data.colours) ? data.colours : (data || {});
-                } catch (e) {
-                    // Can happen if we read mid-write; keep the last good
-                    // scheme, the next change event will fix it.
-                    console.warn("[chrono-widget] could not parse scheme.json:", e);
+                // Only the surface is animated; animating the window's own
+                // dimensions is what caused the compositor-level flicker.
+                Behavior on border.color {
+                    ColorAnimation { duration: 220 }
                 }
             }
-            onLoadFailed: (error) => {
-                console.warn("[chrono-widget] could not read", root.schemePath, error);
+
+            Text {
+                anchors.centerIn: parent
+                text: root.bubbleText
+                color: root.alert ? root.colAccent : root.colText
+                font.family: "monospace"
+                font.pixelSize: 12
+                font.weight: Font.DemiBold
+                // Keep the label inside the circle for long durations.
+                width: parent.width - 6
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
             }
-        }
 
-        // ---- expand / collapse -----------------------------------------------
-        property bool running: false
-        property bool manualOpen: false
-
-        // Expansion is controlled only by the UI toggle/pin state.
-        // Starting, pausing, or resetting the stopwatch must not close it.
-        property bool expanded: manualOpen || mem.pinned
-
-        implicitWidth: expanded ? 288 : 52
-        implicitHeight: expanded ? content.implicitHeight + 36 : 52
-        Behavior on implicitWidth { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
-        Behavior on implicitHeight { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
-
-        // ---- stopwatch state --------------------------------------------------
-        property real swStartedAt: 0
-        property real swAccumMs: 0
-        property real swElapsedMs: 0
-        property var laps: []
-
-        // ---- timer state --------------------------------------------------
-        property real tmEndAt: 0
-        property real tmRemainingMs: mem.timerDurationMs
-        property bool tmFinished: false
-
-        Timer {
-            interval: 16
-            running: root.running
-            repeat: true
-            onTriggered: {
-                if (mem.mode === 0) {
-                    root.swElapsedMs = root.swAccumMs + (Date.now() - root.swStartedAt);
-                } else {
-                    var rem = root.tmEndAt - Date.now();
-                    if (rem <= 0) {
-                        root.tmRemainingMs = 0;
-                        root.running = false;
-                        root.tmFinished = true;
-                    } else {
-                        root.tmRemainingMs = rem;
-                    }
-                }
-            }
-        }
-
-        function fmt(ms, withHour) {
-            var h = Math.floor(ms / 3600000);
-            var m = Math.floor((ms % 3600000) / 60000);
-            var s = Math.floor((ms % 60000) / 1000);
-            var cs = Math.floor((ms % 1000) / 10);
-            function pad(n) { return (n < 10 ? "0" : "") + n; }
-            return (withHour ? pad(h) + ":" : "") + pad(m) + ":" + pad(s) + "." + pad(cs);
-        }
-
-        function toggleStart() {
-            if (mem.mode === 0) {
-                if (root.running) {
-                    root.swAccumMs = root.swElapsedMs;
-                    root.running = false;
-                } else {
-                    root.swStartedAt = Date.now();
-                    root.running = true;
-                }
-            } else {
-                if (root.tmRemainingMs <= 0) return;
-                if (root.running) {
-                    root.tmRemainingMs = root.tmEndAt - Date.now();
-                    root.running = false;
-                } else {
-                    root.tmFinished = false;
-                    root.tmEndAt = Date.now() + root.tmRemainingMs;
-                    root.running = true;
-                }
-            }
-        }
-
-        function reset() {
-            root.running = false;
-            if (mem.mode === 0) {
-                root.swAccumMs = 0; root.swElapsedMs = 0; root.laps = [];
-            } else {
-                root.tmFinished = false;
-                root.tmRemainingMs = mem.timerDurationMs;
-            }
-        }
-
-        function lap() {
-            if (mem.mode !== 0 || !root.running) return;
-            var l = root.laps.slice();
-            l.push(root.swElapsedMs);
-            root.laps = l;
-        }
-
-        function adjustTimer(deltaMs) {
-            if (root.running) return;
-            mem.timerDurationMs = Math.max(0, Math.min(99 * 3600000, mem.timerDurationMs + deltaMs));
-            root.tmRemainingMs = mem.timerDurationMs;
-        }
-
-        // ================= UI =================
-        Rectangle {
-            id: card
-            anchors.fill: parent
-            radius: root.expanded ? 24 : height / 2
-            color: Qt.rgba(pal.surface.r, pal.surface.g, pal.surface.b, 0.94)
-            Behavior on radius { NumberAnimation { duration: 160 } }
-
-            // ---------------- collapsed icon ----------------
             MouseArea {
                 anchors.fill: parent
-                visible: !root.expanded
-                enabled: !root.expanded && !mem.pinned
-                hoverEnabled: true
-                cursorShape: Qt.PointingHandCursor
+                cursorShape: Qt.SizeAllCursor
 
-                property real pressX: 0
-                property real pressY: 0
-                property real travel: 0   // total pointer travel, to tell a click from a drag
-
-                onPressed: (mouse) => { pressX = mouse.x; pressY = mouse.y; travel = 0; }
-                onPositionChanged: (mouse) => {
-                    if (!pressed) return;
-                    var dx = mouse.x - pressX, dy = mouse.y - pressY;
-                    travel += Math.abs(dx) + Math.abs(dy);
-                    root.moveBy(dx, dy);
+                onPressed: function (event) {
+                    root.beginDrag(parent, event);
+                }
+                onPositionChanged: function (event) {
+                    root.updateDrag(parent, event);
                 }
                 onReleased: {
-                    root.commitPosition();
-                    if (travel <= 4) root.manualOpen = !root.manualOpen;
+                    const moved = root.wasDrag();
+                    root.endDrag();
+                    if (!moved)
+                        mem.expanded = true;
                 }
-
-                Rectangle {
-                    anchors.fill: parent
-                    radius: card.radius
-                    color: pal.primary
-                    opacity: parent.pressed ? 0.10 : parent.containsMouse ? 0.08 : 0
-                }
-                Glyph {
-                    anchors.centerIn: parent
-                    name: mem.mode === 0 ? "stopwatch" : "hourglass"
-                    color: pal.primary
-                    size: 24
-                }
+                onExited: root.endDrag()
             }
+        }
 
-            // ---------------- expanded panel ----------------
-            Column {
-                id: content
-                visible: root.expanded
+        /* ---------------- expanded card ---------------- */
+
+        Rectangle {
+            id: panel
+            visible: mem.expanded
+            width: root.panelW
+            height: root.panelH
+            radius: root.radius
+            color: Qt.alpha(root.colSurface, 0.97)
+            border.width: 1
+            border.color: root.colBorder
+
+            ColumnLayout {
                 anchors.fill: parent
-                anchors.margins: 18
-                spacing: 14
+                anchors.margins: root.pad
+                spacing: 10
 
-                // header
-                Item {
-                    width: parent.width
-                    height: 32
+                /* ---- header ---- */
 
-                    Row {
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 8
-                        Glyph {
-                            anchors.verticalCenter: parent.verticalCenter
-                            name: mem.mode === 0 ? "stopwatch" : "hourglass"
-                            color: pal.primary
-                            size: 20
-                        }
-                        Text {
-                            anchors.verticalCenter: parent.verticalCenter
-                            text: mem.mode === 0 ? "Stopwatch" : "Timer"
-                            color: pal.primary
-                            font.pixelSize: 16
-                            font.weight: Font.Medium
-                        }
-                    }
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 6
 
-                    Row {
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        spacing: 2
-
-                        IconBtn {
-                            pal: pal
-                            width: 32; height: 32
-                            kind: "text"; toggle: true
-                            glyph: "pin"; glyphSize: 20
-                            checked: mem.pinned
-                            onClicked: mem.pinned = !mem.pinned
-                        }
-                        IconBtn {
-                            pal: pal
-                            width: 32; height: 32
-                            kind: "text"
-                            glyph: "swap"; glyphSize: 20
-                            visible: !root.running
-                            onClicked: mem.mode = mem.mode === 0 ? 1 : 0
-                        }
-                        IconBtn {
-                            pal: pal
-                            width: 32; height: 32
-                            kind: "text"
-                            glyph: "chevron"; glyphSize: 20
-                            onClicked: { root.manualOpen = false; mem.pinned = false }
-                        }
-                    }
-                }
-
-                // ring + digits
-                Item {
-                    width: parent.width
-                    height: 196
-
-                    Shape {
-                        id: ring
-                        anchors.centerIn: parent
-                        width: 188; height: 188
-                        layer.enabled: true
-                        layer.samples: 4
-                        property real frac: mem.mode === 0
-                            ? ((root.swElapsedMs % 60000) / 60000)
-                            : (mem.timerDurationMs > 0 ? root.tmRemainingMs / mem.timerDurationMs : 0)
-
-                        ShapePath {
-                            strokeWidth: 6
-                            strokeColor: pal.secondaryContainer
-                            fillColor: "transparent"
-                            PathAngleArc {
-                                centerX: 94; centerY: 94
-                                radiusX: 91; radiusY: 91
-                                startAngle: -90; sweepAngle: 360
-                            }
-                        }
-                        ShapePath {
-                            strokeWidth: 6
-                            strokeColor: pal.primary
-                            fillColor: "transparent"
-                            capStyle: ShapePath.RoundCap
-                            PathAngleArc {
-                                centerX: 94; centerY: 94
-                                radiusX: 91; radiusY: 91
-                                startAngle: -90
-                                sweepAngle: mem.mode === 0 ? 360 * ring.frac : -360 * (1 - ring.frac)
-                            }
-                        }
-                    }
-
-                    // "cover art" disc the digits sit on
-                    Rectangle {
-                        anchors.centerIn: parent
-                        width: 168; height: 168; radius: 84
-                        color: pal.surfaceHigh
-                    }
-
-                    Column {
-                        anchors.centerIn: parent
-                        spacing: 8
-                        Text {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            width: 134
-                            horizontalAlignment: Text.AlignHCenter
-                            text: mem.mode === 0 ? root.fmt(root.swElapsedMs, root.swElapsedMs >= 3600000) : root.fmt(root.tmRemainingMs, mem.timerDurationMs >= 3600000)
-                            color: pal.primary
-                            font.pixelSize: 30
-                            font.bold: true
-                            font.family: "monospace"
-                            fontSizeMode: Text.Fit
-                            minimumPixelSize: 16
-                        }
-                        Row {
-                            anchors.horizontalCenter: parent.horizontalCenter
-                            spacing: 6
-                            visible: mem.mode === 1 && !root.running
-                            Column {
-                                spacing: 4
-                                Chip { pal: pal; width: 46; label: "+1m"; onClicked: root.adjustTimer(60000) }
-                                Chip { pal: pal; width: 46; label: "−1m"; onClicked: root.adjustTimer(-60000) }
-                            }
-                            Column {
-                                spacing: 4
-                                Chip { pal: pal; width: 46; label: "+10s"; onClicked: root.adjustTimer(10000) }
-                                Chip { pal: pal; width: 46; label: "−10s"; onClicked: root.adjustTimer(-10000) }
-                            }
-                        }
-                    }
-                }
-
-                // controls — same layout as the MPRIS button row:
-                // tonal | filled (stretches, morphs while active) | tonal
-                Row {
-                    width: parent.width
-                    height: 56
-                    spacing: 4
-
-                    IconBtn {
-                        pal: pal
-                        width: 56; height: 56
-                        kind: "tonal"
-                        glyph: "reset"
-                        onClicked: root.reset()
-                    }
-                    IconBtn {
-                        pal: pal
-                        width: parent.width - 56 * 2 - 4 * 2; height: 56
-                        kind: "filled"
-                        checked: root.running
-                        glyph: root.running ? "pause" : "play"
-                        onClicked: root.toggleStart()
-                    }
-                    IconBtn {
-                        pal: pal
-                        width: 56; height: 56
-                        kind: "tonal"
-                        glyph: "flag"
-                        enabled: mem.mode === 0
-                        onClicked: root.lap()
-                    }
-                }
-
-                // laps
-                Rectangle {
-                    width: parent.width
-                    height: 12 + 24 + 4 + 66 + 12
-                    radius: 16
-                    color: pal.surfaceHigh
-                    visible: mem.mode === 0 && root.laps.length > 0
-
+                    // Drag handle across the header.
                     Item {
-                        anchors.fill: parent
-                        anchors.margins: 12
+                        Layout.fillWidth: true
+                        Layout.preferredHeight: 26
 
-                        Item {
-                            id: lapHeader
-                            width: parent.width
-                            height: 24
-                            Text {
-                                anchors.verticalCenter: parent.verticalCenter
-                                text: "Laps"
-                                color: pal.primary
-                                font.pixelSize: 12
-                                font.weight: Font.Medium
+                        // Declared first so the chips below sit on top of it:
+                        // in QML a later sibling wins input, so a drag area
+                        // placed after them would swallow every chip click.
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.SizeAllCursor
+                            acceptedButtons: Qt.LeftButton
+
+                            onPressed: function (event) {
+                                root.beginDrag(parent, event);
                             }
-                            Chip {
-                                pal: pal
-                                anchors.right: parent.right
-                                tonal: false
-                                label: "Clear"
-                                onClicked: root.laps = []
+                            onPositionChanged: function (event) {
+                                root.updateDrag(parent, event);
                             }
+                            onReleased: root.endDrag()
+                            onExited: root.endDrag()
                         }
 
-                        ListView {
-                            anchors.top: lapHeader.bottom
-                            anchors.topMargin: 4
-                            width: parent.width
-                            height: 66
-                            clip: true
-                            boundsBehavior: Flickable.StopAtBounds
-                            model: root.laps.slice().reverse()
-                            delegate: Item {
-                                width: ListView.view.width
-                                height: 22
-                                Text {
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: "#" + (root.laps.length - index)
-                                    color: pal.primary
-                                    font.pixelSize: 12
-                                }
-                                Text {
-                                    anchors.right: parent.right
-                                    anchors.verticalCenter: parent.verticalCenter
-                                    text: root.fmt(modelData, false)
-                                    color: pal.primary
-                                    font.pixelSize: 12
-                                    font.family: "monospace"
+                        Row {
+                            anchors.fill: parent
+                            spacing: 6
+
+                            Repeater {
+                                model: [
+                                    { label: "Stopwatch", value: 0 },
+                                    { label: "Timer", value: 1 }
+                                ]
+
+                                delegate: Rectangle {
+                                    required property var modelData
+
+                                    readonly property bool active:
+                                        mem.mode === modelData.value
+
+                                    width: chipText.implicitWidth + 18
+                                    height: 24
+                                    radius: 12
+                                    color: active
+                                        ? Qt.alpha(root.colAccent, 0.22)
+                                        : Qt.alpha(root.colText, 0.05)
+                                    border.width: 1
+                                    border.color: active
+                                        ? Qt.alpha(root.colAccent, 0.55)
+                                        : root.colBorder
+
+                                    Text {
+                                        id: chipText
+                                        anchors.centerIn: parent
+                                        text: modelData.label
+                                        color: parent.active ? root.colText : root.colDim
+                                        font.pixelSize: 11
+                                    }
+
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        cursorShape: Qt.PointingHandCursor
+                                        onClicked: root.setMode(modelData.value)
+                                    }
                                 }
                             }
                         }
                     }
+
+                    RoundButton {
+                        icon: "x"
+                        onTriggered: mem.expanded = false
+                    }
                 }
-            }
 
-            // drag surface for the expanded panel — sits under the content
-            // (z: -1) so buttons/rings still get clicks; commits position
-            // once per drag instead of every frame.
-            MouseArea {
-                anchors.fill: parent
-                visible: root.expanded
-                enabled: !mem.pinned
-                z: -1
-                propagateComposedEvents: true
+                /* ---- readout ---- */
 
-                property real pressX: 0
-                property real pressY: 0
-
-                onPressed: (mouse) => { pressX = mouse.x; pressY = mouse.y; }
-                onPositionChanged: (mouse) => {
-                    if (!pressed) return;
-                    root.moveBy(mouse.x - pressX, mouse.y - pressY);
+                Text {
+                    Layout.fillWidth: true
+                    text: mem.mode === 0 ? root.stopwatchText : root.timerText
+                    color: root.alert ? root.colAccent : root.colText
+                    font.family: "monospace"
+                    font.pixelSize: mem.mode === 0 ? 34 : 40
+                    font.weight: Font.DemiBold
+                    horizontalAlignment: Text.AlignHCenter
+                    elide: Text.ElideRight
                 }
-                onReleased: root.commitPosition()
+
+                /* ---- countdown bar (timer only) ---- */
+
+                Item {
+                    Layout.fillWidth: true
+                    Layout.preferredHeight: 4
+                    visible: mem.mode === 1
+
+                    Rectangle {
+                        anchors.fill: parent
+                        radius: 2
+                        color: Qt.alpha(root.colText, 0.16)
+                    }
+                    Rectangle {
+                        width: Math.max(0, parent.width * root.timerProgress)
+                        height: parent.height
+                        radius: 2
+                        color: root.alert ? root.colAccent : root.colDim
+                    }
+                }
+
+                /* ---- timer presets ---- */
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 4
+                    visible: mem.mode === 1
+
+                    Repeater {
+                        model: [1, 3, 5, 10, 15]
+                        delegate: Rectangle {
+                            required property int modelData
+                            readonly property bool active:
+                                mem.timerMinutes === modelData
+
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 26
+                            radius: 8
+                            color: active
+                                ? Qt.alpha(root.colAccent, 0.22)
+                                : Qt.alpha(root.colText, 0.05)
+                            border.width: 1
+                            border.color: active
+                                ? Qt.alpha(root.colAccent, 0.55) : root.colBorder
+
+                            Text {
+                                anchors.centerIn: parent
+                                text: modelData + "m"
+                                color: parent.active ? root.colText : root.colDim
+                                font.pixelSize: 11
+                            }
+
+                            MouseArea {
+                                anchors.fill: parent
+                                cursorShape: Qt.PointingHandCursor
+                                onClicked: root.setTimerMinutes(modelData)
+                            }
+                        }
+                    }
+                }
+
+                /* ---- laps (stopwatch only) ---- */
+
+                ListView {
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    clip: true
+                    spacing: 2
+                    visible: mem.mode === 0
+                    model: root.laps
+                    // Newest lap first, like a real stopwatch.
+                    orientation: ListView.Vertical
+
+                    delegate: RowLayout {
+                        required property int index
+                        required property var modelData
+
+                        width: ListView.view.width
+                        height: 20
+
+                        Text {
+                            text: "#" + modelData.index
+                            color: root.colDim
+                            font.pixelSize: 10
+                            font.family: "monospace"
+                        }
+                        Item { Layout.fillWidth: true }
+                        Text {
+                            text: root.delta(modelData.total)
+                            color: root.colText
+                            font.pixelSize: 11
+                            font.family: "monospace"
+                        }
+                    }
+
+                    // Show the most recent laps when they overflow.
+                    onCountChanged: if (count > 0) positionViewAtBeginning()
+                }
+
+                Item {
+                    Layout.fillHeight: true
+                    visible: mem.mode === 1
+                }
+
+                /* ---- transport ---- */
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    spacing: 8
+
+                    RoundButton {
+                        Layout.fillWidth: true
+                        icon: "rotate-ccw"
+                        onTriggered: root.reset()
+                    }
+
+                    // Both modes ran or paused identically here -- the old
+                    // ternary tested `mem.mode` and then picked the same
+                    // glyph either way, so the mode check was dead code.
+                    RoundButton {
+                        Layout.fillWidth: true
+                        icon: root.running ? "square" : "play"
+                        prominent: true
+                        onTriggered: root.toggle()
+                    }
+
+                    RoundButton {
+                        Layout.fillWidth: true
+                        icon: "plus"
+                        visible: mem.mode === 0
+                        onTriggered: root.lap()
+                    }
+
+                    RoundButton {
+                        Layout.fillWidth: true
+                        icon: "skip-forward"
+                        visible: mem.mode === 1
+                        onTriggered: root.setTimerMinutes(mem.timerMinutes + 1)
+                    }
+                }
             }
         }
     }
 
-    ChronoWidget {}
+    /* =================================================================
+     * Small reusable control
+     * ================================================================= */
+
+    component RoundButton: Rectangle {
+        id: btn
+
+        // A Lucide icon name drawn as vector paths, rather than a
+        // transport character. Those codepoints are claimed by 50-170
+        // installed fonts each and Qt resolves a font per glyph, so a row
+        // of these could otherwise mix several unrelated typefaces.
+        property string icon: ""
+        property bool prominent: false
+        signal triggered()
+
+        implicitWidth: 38
+        implicitHeight: 34
+        radius: 10
+        color: prominent
+            ? (hover.hovered ? Qt.lighter(root.colAccent, 1.1) : root.colAccent)
+            : (hover.hovered ? Qt.alpha(root.colText, 0.10) : Qt.alpha(root.colText, 0.05))
+        border.width: prominent ? 0 : 1
+        border.color: root.colBorder
+
+        Glyph {
+            anchors.centerIn: parent
+            width: btn.prominent ? 17 : 15
+            height: width
+            icon: btn.icon
+            color: btn.prominent ? root.colOnAccent : root.colText
+        }
+
+        HoverHandler {
+            id: hover
+            cursorShape: Qt.PointingHandCursor
+        }
+
+        TapHandler {
+            onTapped: btn.triggered()
+        }
+    }
 }
