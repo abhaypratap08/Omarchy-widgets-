@@ -10,11 +10,12 @@ Quickshell configuration — it imports no private Omarchy QML modules.
 ## ✨ Features
 
 - ⏱️ Stopwatch with centisecond resolution and lap times
-- ⏳ Countdown timer with 1/3/5/10/15-minute presets
+- ⏳ Countdown timer with 1/3/5/10/15/25/30/45/60-minute presets (including 25min pomodoro)
 - 🫧 One tap to expand, drag to reposition anywhere on screen
-- 💾 Position, mode, and timer length persist across restarts
+- 💾 Position, mode, timer length, and lap times persist across restarts
 - 🎨 Live Omarchy theme colors, light and dark
 - 🔒 Stays on screen: the position is clamped to the monitor
+- ✅ Timer finishes with persistent visual indicator (stays highlighted until reset)
 
 ## Requirements
 
@@ -50,7 +51,7 @@ systemctl --user enable --now qs-stopwatch
 | Close the card | `✕` in the header |
 | Move the widget | Drag the bubble, or the empty part of the header |
 | Stopwatch | `▶` starts, `■` stops, `＋` records a lap, `↺` resets |
-| Timer | Pick a preset, then `▶` starts, `↺` resets |
+| Timer | Pick a preset (1/3/5/10/15/25/30/45/60m), then `▶` starts, `↺` resets |
 
 ## Theming
 
@@ -62,6 +63,10 @@ The widget reads the same public theme state the Omarchy shell uses:
 Theme switches are detected through the `theme.name` marker, which Omarchy
 writes after it has replaced the generated theme directory. Parsing is inline
 and local, so the config stays standalone.
+
+**Fallback behavior:** If the theme files are not found (e.g., on a fresh
+Omarchy install or non-Omarchy system), the widget uses built-in fallback
+colors (dark theme with yellow accent) and continues to work normally.
 
 ## Customization
 
@@ -95,3 +100,8 @@ At the top of `shell.qml`:
   tick interval, so a late or skipped tick cannot make the clock drift.
 - The bubble shows `M:SS`; the expanded card shows centiseconds in stopwatch
   mode. Both use a monospace font so the text does not jitter as digits change.
+- **Timer finish persists visually.** When a countdown reaches zero, the
+  accent highlight remains on the bubble and card until you press `↺` (reset).
+  This fixes the previous bug where the finished state flashed and disappeared.
+- **Lap times persist.** Stopwatch laps are saved to disk and restored on
+  restart.

@@ -400,6 +400,7 @@ ShellRoot {
         property bool expanded: false
         property int mode: 0          // 0 = stopwatch, 1 = timer
         property int timerMinutes: 5
+        property var laps: []         // stopwatch lap times in ms
     }
 
     /* =================================================================
@@ -413,14 +414,15 @@ ShellRoot {
     property bool running: false
     property real bankedMs: 0        // time accumulated by previous runs
     property real startedAt: 0       // Date.now() when the current run began
-    property var laps: []            // stopwatch lap times in ms
+    property bool timerJustFinished: false  // tracks if timer hit zero
+    property int tickTrigger: 0      // increments on each tick to refresh bindings
 
     readonly property real nowMs: running ? (Date.now() - startedAt) : 0
     readonly property real elapsedMs: bankedMs + nowMs
 
     readonly property int timerTotalMs: mem.timerMinutes * 60 * 1000
     readonly property real timerRemainingMs: Math.max(0, timerTotalMs - elapsedMs)
-    readonly property bool timerFinished: mem.mode === 1 && running
+    readonly property bool timerFinished: mem.mode === 1
         && timerTotalMs > 0 && timerRemainingMs <= 0
 
     readonly property real timerProgress: {
@@ -436,8 +438,12 @@ ShellRoot {
         repeat: true
         running: root.running
         onTriggered: {
-            if (root.timerFinished)
-                root.stop();
+            tickTrigger = (tickTrigger + 1) & 0x7fffffff; // force binding refresh
+            if (mem.mode === 1 && running
+                && timerTotalMs > 0 && timerRemainingMs <= 0) {
+                timerJustFinished = true;
+                stop();
+            }
         }
     }
 
@@ -447,6 +453,7 @@ ShellRoot {
         // Restarting a finished timer restarts the full duration.
         if (mem.mode === 1 && elapsedMs >= timerTotalMs)
             reset();
+        timerJustFinished = false;
         startedAt = Date.now();
         running = true;
     }
@@ -469,13 +476,15 @@ ShellRoot {
         running = false;
         bankedMs = 0;
         startedAt = 0;
-        laps = [];
+        timerJustFinished = false;
+        mem.laps = [];
     }
 
     function lap() {
         if (mem.mode !== 0)
             return;
-        laps = laps.concat([{ index: laps.length + 1, total: elapsedMs }]);
+        const newLap = { index: mem.laps.length + 1, total: elapsedMs };
+        mem.laps = mem.laps.concat([newLap]);
     }
 
     function setMode(next) {
@@ -536,7 +545,7 @@ ShellRoot {
     // Highlights the bubble when there is something worth noticing.
     readonly property bool alert: {
         if (mem.mode === 1)
-            return timerFinished || (running && timerRemainingMs > 0
+            return timerJustFinished || (running && timerRemainingMs > 0
                 && timerRemainingMs <= 10000);
         return running;
     }
@@ -829,7 +838,7 @@ ShellRoot {
                     visible: mem.mode === 1
 
                     Repeater {
-                        model: [1, 3, 5, 10, 15]
+                        model: [1, 3, 5, 10, 15, 25, 30, 45, 60]
                         delegate: Rectangle {
                             required property int modelData
                             readonly property bool active:
@@ -869,7 +878,7 @@ ShellRoot {
                     clip: true
                     spacing: 2
                     visible: mem.mode === 0
-                    model: root.laps
+                    model: mem.laps
                     // Newest lap first, like a real stopwatch.
                     orientation: ListView.Vertical
 
